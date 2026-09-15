@@ -544,6 +544,21 @@ void GdaApp::MacOpenFiles(const wxArrayString& fileNames)
 int GdaApp::OnExit(void)
 {
     if (checker) delete checker;
+
+    // Flush and drop the log target here, while the GUI still exists. OnExit()
+    // runs before wxEntryCleanup() destroys the top-level windows; doing this
+    // from ~GdaApp() instead flushes the target *after* the frame -- and with
+    // it the MCP server -- is gone. A wxLogGui target with buffered messages
+    // raises a modal dialog on flush, and that modal pumps the event loop over
+    // half-destroyed objects: a socket left armed by the MCP server calls back
+    // into its deleted handler and crashes (EXC_BAD_ACCESS in
+    // wxSocketBase::OnRequest). GeoDa's 3D scatter plot installs a wxLogWindow
+    // and restores no target, so a wxLogGui can be the active target by then.
+    wxLog::SetActiveTarget(NULL);
+    // Nothing logged from here on should re-create a GUI target that would
+    // only be flushed (and modalled) during teardown.
+    wxLog::DontCreateOnDemand();
+
 	return 0;
 }
 

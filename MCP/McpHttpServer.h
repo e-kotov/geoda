@@ -22,9 +22,11 @@
 
 #include <atomic>
 #include <map>
+#include <set>
 #include <string>
 #include <wx/event.h>
 #include <wx/socket.h>
+#include <wx/thread.h>
 
 class McpServer;
 
@@ -36,10 +38,19 @@ class McpServer;
 // Threading: light tools (project/status, table/*, weights/*) and window
 // tools (window/create_map, window/create_plot -- wx window creation is
 // main-thread-only) are handled synchronously on the main thread. Heavy tools
-// (LISA with permutations, clustering) spawn a detached wxThread that computes
+// (LISA with permutations, clustering) spawn a worker wxThread that computes
 // the result and writes the response to the handed-off socket; the main thread
 // never touches the socket after handoff. At most kMaxWorkers heavy tools run
 // concurrently; further heavy requests are rejected with 503.
+//
+// Lifetime: every socket this server owns is tracked in m_clients, so Stop()
+// can disarm and destroy all of them. A wxSocketBase left open keeps its
+// CFSocket registered with the run loop and calls back into its event handler
+// (this object); if the handler is destroyed first, the next event that pumps
+// -- e.g. the modal dialog a buffered wxLogGui raises during shutdown --
+// dereferences a dead wxEvtHandler and the process crashes. Stop() therefore
+// also waits for in-flight workers before releasing the socket and the
+// McpServer they borrowed.
 class McpHttpServer : public wxEvtHandler
 {
 public:
@@ -57,6 +68,16 @@ private:
     // Maximum number of concurrent heavy-tool worker threads.
     static const int kMaxWorkers = 4;
 
+    // State of one client connection. Tracked from the moment the socket is
+    // accepted, not from the first byte read: a connection that never sends a
+    // complete request must still be destroyed by Stop().
+    struct Client {
+        Client() : handed_off(false) {}
+        std::string buffer;  // request bytes received so far
+        bool handed_off;     // a worker owns the socket until it posts back
+    };
+    typedef std::map<wxSocketBase*, Client> ClientMap;
+
     void OnServerEvent(wxSocketEvent& event);
     void OnClientEvent(wxSocketEvent& event);
     // Closes and destroys a socket handed back from a worker thread. wxSocket
@@ -68,14 +89,26 @@ private:
                       int status);
     void SendCorsPreflight(wxSocketBase* socket);
     void SendHealth(wxSocketBase* socket);
+    // Disarm, close and destroy a tracked socket, dropping it from m_clients.
+    // The only place a client socket is destroyed; safe to call twice.
+    void Retire(wxSocketBase* socket);
+    // Wait for and delete workers whose Entry() has already returned.
+    void ReapWorkers();
 
     wxSocketServer* m_server;
     int m_port;
     McpServer* m_mcp;
-    // Sockets with partially-received requests -> accumulated raw bytes.
-    std::map<wxSocketBase*, std::string> m_buffers;
+    // Every client socket we own, with its accumulated request bytes.
+    ClientMap m_clients;
+    // Joinable heavy-tool workers, waited on by Stop() and reaped as they
+    // finish. Detached threads could not be waited for, which left a worker
+    // holding a socket and m_mcp past their destruction.
+    std::set<wxThread*> m_workers;
     // Number of heavy-tool workers currently running (bounded by kMaxWorkers).
     std::atomic<int> m_active_workers;
+    // Set by Stop(); read by workers so they do not post to a handler that is
+    // going away. Cleared by Start().
+    std::atomic<bool> m_stopping;
 
     wxDECLARE_NO_COPY_CLASS(McpHttpServer);
     wxDECLARE_EVENT_TABLE();

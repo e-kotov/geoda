@@ -171,14 +171,20 @@ namespace
 // socket exclusively: computes the result and writes the response. The socket
 // is then handed back to the main thread (via a queued event) for closing --
 // wxSocket on macOS must be closed on the thread that created it.
+//
+// The thread is joinable, not detached: Stop() has to be able to wait for a
+// running worker before it destroys the socket and the McpServer the worker is
+// using. A detached worker would keep writing into both.
 class McpWorkerThread : public wxThread
 {
 public:
     McpWorkerThread(wxSocketBase* socket, const std::string& body,
                     McpServer* mcp, wxEvtHandler* handler,
-                    std::atomic<int>* active_workers)
-        : wxThread(wxTHREAD_DETACHED), m_socket(socket), m_body(body),
-          m_mcp(mcp), m_handler(handler), m_active_workers(active_workers) {}
+                    std::atomic<int>* active_workers,
+                    std::atomic<bool>* stopping)
+        : wxThread(wxTHREAD_JOINABLE), m_socket(socket), m_body(body),
+          m_mcp(mcp), m_handler(handler), m_active_workers(active_workers),
+          m_stopping(stopping) {}
 
     virtual void* Entry()
     {
@@ -189,9 +195,13 @@ public:
         } catch (...) {
             // Never leak the worker slot: fall through and release it below.
         }
-        wxCommandEvent evt(wxEVT_MCP_SOCKET_CLOSE);
-        evt.SetClientData(m_socket);
-        wxQueueEvent(m_handler, evt.Clone());
+        // While stopping, Stop() destroys this socket itself after waiting for
+        // us -- posting it back would be pointless and racy.
+        if (!m_stopping->load()) {
+            wxCommandEvent evt(wxEVT_MCP_SOCKET_CLOSE);
+            evt.SetClientData(m_socket);
+            wxQueueEvent(m_handler, evt.Clone());
+        }
         if (m_active_workers) --(*m_active_workers);
         return NULL;
     }
@@ -202,6 +212,7 @@ private:
     McpServer* m_mcp;
     wxEvtHandler* m_handler;
     std::atomic<int>* m_active_workers;
+    std::atomic<bool>* m_stopping;
 };
 
 BEGIN_EVENT_TABLE(McpHttpServer, wxEvtHandler)
@@ -212,7 +223,7 @@ END_EVENT_TABLE()
 
 McpHttpServer::McpHttpServer(int port)
     : m_server(NULL), m_port(port), m_mcp(new McpServer()),
-      m_active_workers(0)
+      m_active_workers(0), m_stopping(false)
 {
 }
 
@@ -225,6 +236,7 @@ McpHttpServer::~McpHttpServer()
 bool McpHttpServer::Start()
 {
     if (m_server) return true;
+    m_stopping = false;
 
     // Preferred port first, then the next few (so a second GeoDa instance
     // lands on a nearby port rather than a random one), then let the OS pick.
@@ -260,6 +272,9 @@ bool McpHttpServer::Start()
 
 void McpHttpServer::Stop()
 {
+    if (m_stopping) return;
+    m_stopping = true;
+
     if (m_server) {
         m_server->Notify(false);
         m_server->Close();
@@ -267,12 +282,63 @@ void McpHttpServer::Stop()
         m_server = NULL;
         DeleteDiscoveryFile(m_port);
     }
-    for (std::map<wxSocketBase*, std::string>::iterator it = m_buffers.begin();
-         it != m_buffers.end(); ++it) {
-        it->first->Notify(false);
-        it->first->Destroy();
+
+    // Let in-flight heavy tools finish before their sockets and m_mcp are
+    // released -- a worker holds both directly. This can block for as long as
+    // the running permutation/cluster job takes, which is the price of not
+    // tearing the object out from under it.
+    for (std::set<wxThread*>::iterator it = m_workers.begin();
+         it != m_workers.end(); ++it) {
+        (*it)->Wait();
+        delete *it;
     }
-    m_buffers.clear();
+    m_workers.clear();
+
+    // Destroy every socket we still own. Any that survived would keep its
+    // CFSocket registered with the run loop and dispatch the next event into
+    // this handler, which the caller is about to delete.
+    for (ClientMap::iterator it = m_clients.begin(); it != m_clients.end();
+         ++it) {
+        wxSocketBase* sock = it->first;
+        sock->SetNotify(0);
+        sock->Notify(false);
+        sock->Close();
+        sock->Destroy();
+    }
+    m_clients.clear();
+}
+
+// Close and destroy a tracked socket. Guarded by a lookup so a stale event --
+// a worker posting back a socket Stop() already destroyed, a LOST after an
+// error response -- is a no-op rather than a double destroy.
+void McpHttpServer::Retire(wxSocketBase* socket)
+{
+    if (!socket) return;
+    ClientMap::iterator it = m_clients.find(socket);
+    if (it == m_clients.end()) return;
+    m_clients.erase(it);
+    socket->SetNotify(0);
+    socket->Notify(false);
+    socket->Close();
+    socket->Destroy();
+}
+
+// Reap workers that have returned from Entry(). Joinable threads must be
+// Wait()ed for before deletion; Wait() on a finished thread returns at once,
+// so this never blocks for long.
+void McpHttpServer::ReapWorkers()
+{
+    for (std::set<wxThread*>::iterator it = m_workers.begin();
+         it != m_workers.end(); ) {
+        wxThread* worker = *it;
+        if (worker->IsAlive()) {
+            ++it;
+        } else {
+            worker->Wait();
+            delete worker;
+            it = m_workers.erase(it);
+        }
+    }
 }
 
 wxString McpHttpServer::GetUrl() const
@@ -282,9 +348,14 @@ wxString McpHttpServer::GetUrl() const
 
 void McpHttpServer::OnServerEvent(wxSocketEvent& event)
 {
+    if (m_stopping || !m_server) return;
     if (event.GetSocketEvent() != wxSOCKET_CONNECTION) return;
     wxSocketBase* client = m_server->Accept(false);
     if (!client) return;
+    // Track from here, not from the first byte read: a client that connects
+    // and then goes quiet would otherwise never be in m_clients and Stop()
+    // would leave its socket armed.
+    m_clients[client] = Client();
     client->SetFlags(wxSOCKET_NOWAIT_READ);
     client->SetEventHandler(*this, MCP_CLIENT_SOCKET_ID);
     client->SetNotify(wxSOCKET_INPUT_FLAG | wxSOCKET_LOST_FLAG);
@@ -296,15 +367,17 @@ void McpHttpServer::OnClientEvent(wxSocketEvent& event)
     wxSocketBase* sock = event.GetSocket();
     wxSocketNotify notify = event.GetSocketEvent();
 
+    if (m_stopping) return;
+
+    // Only touch sockets we still own. A stale event -- for a socket already
+    // destroyed, or one owned by a worker -- is ignored; we compare the
+    // pointer value only, never dereference it.
+    ClientMap::iterator it = m_clients.find(sock);
+    if (it == m_clients.end()) return;
+    if (it->second.handed_off) return;
+
     if (notify == wxSOCKET_LOST) {
-        // Only touch sockets we are tracking. Sockets handed off to a worker
-        // thread (or already destroyed) are ignored -- we only compare the
-        // pointer value, never dereference it.
-        std::map<wxSocketBase*, std::string>::iterator it = m_buffers.find(sock);
-        if (it != m_buffers.end()) {
-            m_buffers.erase(it);
-            sock->Destroy();
-        }
+        Retire(sock);
         return;
     }
 
@@ -314,7 +387,7 @@ void McpHttpServer::OnClientEvent(wxSocketEvent& event)
     wxUint32 n = sock->Read(buf, sizeof(buf)).LastReadCount();
     if (n == 0) return;
 
-    std::string& buffer = m_buffers[sock];
+    std::string& buffer = it->second.buffer;
     buffer.append(buf, n);
 
     size_t header_end = buffer.find("\r\n\r\n");
@@ -327,27 +400,22 @@ void McpHttpServer::OnClientEvent(wxSocketEvent& event)
     // GET (health check) and OPTIONS (preflight) carry no body, so they can
     // be handled as soon as the header block has arrived.
     if (method == "GET" || method == "OPTIONS") {
-        m_buffers.erase(sock);
-        sock->Notify(false);
         HandleRequest(sock, method, path, "");
         return;
     }
 
     int content_length = ParseContentLength(headers);
     if (content_length < 0) {
-        m_buffers.erase(sock);
-        sock->Notify(false);
-        sock->Close();
-        sock->Destroy();
+        Retire(sock);
         return;
     }
 
     size_t body_start = header_end + 4;
     if (buffer.size() < body_start + (size_t)content_length) return;
 
+    // Copy before HandleRequest(), which retires or hands off the socket and
+    // so invalidates the map entry holding the buffer.
     std::string body = buffer.substr(body_start, (size_t)content_length);
-    m_buffers.erase(sock);
-    sock->Notify(false);
     HandleRequest(sock, method, path, body);
 }
 
@@ -356,10 +424,8 @@ void McpHttpServer::OnClientEvent(wxSocketEvent& event)
 void McpHttpServer::OnSocketClose(wxCommandEvent& event)
 {
     wxSocketBase* sock = (wxSocketBase*)event.GetClientData();
-    if (sock) {
-        sock->Close();
-        sock->Destroy();
-    }
+    Retire(sock);
+    ReapWorkers();
 }
 
 void McpHttpServer::HandleRequest(wxSocketBase* socket,
@@ -369,63 +435,68 @@ void McpHttpServer::HandleRequest(wxSocketBase* socket,
 {
     if (method == "OPTIONS") {
         SendCorsPreflight(socket);
-        socket->Close();
-        socket->Destroy();
+        Retire(socket);
         return;
     }
     if (method == "GET" && path == "/") {
         SendHealth(socket);
-        socket->Close();
-        socket->Destroy();
+        Retire(socket);
         return;
     }
     if (method != "POST" || path != "/mcp") {
         SendResponse(socket, "{\"error\":\"not found\"}", 404);
-        socket->Close();
-        socket->Destroy();
+        Retire(socket);
         return;
     }
 
     json_spirit::Value request;
     if (!json_spirit::read(body, request)) {
         SendResponse(socket, json_spirit::write(m_mcp->MakeParseError()), 200);
-        socket->Close();
-        socket->Destroy();
+        Retire(socket);
         return;
     }
 
     if (m_mcp->IsHeavyTool(request)) {
+        // Reap any worker that already finished, so a completion event lost
+        // on the way here cannot make the worker list grow without bound.
+        ReapWorkers();
         // Bound the number of concurrent heavy-tool workers so a client
         // cannot exhaust threads/CPU. When at capacity, reject the request
         // with 503 instead of queueing unbounded work.
         if (m_active_workers >= kMaxWorkers) {
             SendResponse(socket, "{\"error\":\"server busy\"}", 503);
-            socket->Close();
-            socket->Destroy();
+            Retire(socket);
             return;
         }
         ++m_active_workers;
-        // Hand off to a worker thread. Detach the socket from the main
-        // thread's event loop first so the worker owns it exclusively; the
-        // worker posts it back for closing when done.
+        // Hand off to a worker thread. Disarm the socket for the main thread's
+        // event loop first so the worker owns it exclusively; the worker posts
+        // it back for closing when done. The socket stays in m_clients so
+        // Stop() can wait for the worker and then destroy it.
         socket->SetNotify(0);
         socket->Notify(false);
-        McpWorkerThread* thread =
-            new McpWorkerThread(socket, body, m_mcp, this, &m_active_workers);
-        if (thread->Create() == wxTHREAD_NO_ERROR) {
-            thread->Run();
+        ClientMap::iterator it = m_clients.find(socket);
+        if (it != m_clients.end()) it->second.handed_off = true;
+        McpWorkerThread* thread = new McpWorkerThread(
+            socket, body, m_mcp, this, &m_active_workers, &m_stopping);
+        // Both steps have to succeed: a thread object that was created but
+        // never started must not reach m_workers, where Stop()/ReapWorkers()
+        // would Wait() on it.
+        bool started = thread->Create() == wxTHREAD_NO_ERROR &&
+                       thread->Run() == wxTHREAD_NO_ERROR;
+        if (started) {
+            m_workers.insert(thread);
         } else {
             --m_active_workers;
             delete thread;
+            if (it != m_clients.end()) it->second.handed_off = false;
             SendResponse(socket, "{\"error\":\"internal\"}", 500);
-            socket->Close();
-            socket->Destroy();
+            Retire(socket);
         }
     } else {
         json_spirit::Value response = m_mcp->HandleRequest(body);
         SendResponse(socket, json_spirit::write(response), 200);
-        socket->Close();
-        socket->Destroy();
+        Retire(socket);
     }
 }
 
