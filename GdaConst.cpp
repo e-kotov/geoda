@@ -329,7 +329,11 @@ bool GdaConst::gda_create_csvt = false;
 bool GdaConst::gda_enable_set_transparency_windows = false;
 int GdaConst::default_display_decimals = 6; // move in preference
 double GdaConst::gda_autoweight_stop = 0.0001; // move in preference
+#if defined(__WXMAC__) || defined(__APPLE__)
+bool GdaConst::gda_use_gpu = true;
+#else
 bool GdaConst::gda_use_gpu = false;
+#endif
 int GdaConst::gda_ui_language = 0;
 double GdaConst::gda_eigen_tol = 0.00000001;
 bool GdaConst::gda_set_cpu_cores = true;

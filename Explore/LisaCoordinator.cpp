@@ -571,6 +571,7 @@ void LisaCoordinator::CalcPseudoP()
         
         bool flag = false;
         wxString exePath = GenUtils::GetExeDir();
+        wxStopWatch sw_gpu;
 #ifdef __WXMAC__
         if (is_metal_supported()) {
             wxString metalPath = exePath + "../Resources/lisa_kernel.metal";
@@ -590,6 +591,7 @@ void LisaCoordinator::CalcPseudoP()
         wxString clPath = exePath + "lisa_kernel.cl";
         flag = gpu_lisa(clPath.mb_str(), num_obs, permutations, last_seed_used, values, local_moran, w, _sigLocal);
 #endif
+        long gpu_time = sw_gpu.Time();
         
 		if (flag) {
 		   for (int cnt=0; cnt<num_obs; cnt++) {
@@ -606,6 +608,41 @@ void LisaCoordinator::CalcPseudoP()
                    _sigCat[cnt] = 6;
                }
            }
+
+           // Benchmark CPU for comparison
+           std::vector<double> gpu_sigLocal(num_obs);
+           std::vector<int> gpu_sigCat(num_obs);
+           int* _sigCat = sig_cat_vecs[0];
+           for (int i=0; i<num_obs; ++i) {
+               gpu_sigLocal[i] = _sigLocal[i];
+               gpu_sigCat[i] = _sigCat[i];
+           }
+
+           wxStopWatch sw_cpu;
+           CalcPseudoP_threaded();
+           long cpu_time = sw_cpu.Time();
+
+           // Restore GPU results
+           for (int i=0; i<num_obs; ++i) {
+               _sigLocal[i] = gpu_sigLocal[i];
+               _sigCat[i] = gpu_sigCat[i];
+           }
+
+           double speedup = (gpu_time > 0) ? ((double)cpu_time / (double)gpu_time) : 0.0;
+           int nCPUs = GdaConst::gda_set_cpu_cores ? GdaConst::gda_cpu_cores : wxThread::GetCPUCount();
+           wxString msg = wxString::Format(
+               "⚡ Apple Metal GPU vs CPU Benchmark (Local Moran)\n\n"
+               "• Observations: %d\n"
+               "• Permutations: %d\n"
+               "• CPU Cores: %d\n\n"
+               "⏱️ Apple Metal GPU:  %ld ms\n"
+               "⏱️ CPU Multi-Core:   %ld ms\n\n"
+               "🚀 GPU Speedup:      %.2fx %s",
+               num_obs, permutations, nCPUs,
+               gpu_time, cpu_time, speedup,
+               (speedup >= 1.0) ? "faster!" : ""
+           );
+           wxMessageBox(msg, "GeoDa Metal Performance", wxOK | wxICON_INFORMATION);
 		} else {
 			wxMessageDialog dlg(NULL, "GeoDa can't configure GPU device. Default CPU solution will be used instead.", _("Error"), wxOK | wxICON_ERROR);
 			dlg.ShowModal();

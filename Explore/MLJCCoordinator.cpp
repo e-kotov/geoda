@@ -490,6 +490,7 @@ void JCCoordinator::CalcPseudoP()
             
             bool flag = false;
             wxString exePath = GenUtils::GetExeDir();
+            wxStopWatch sw_gpu;
 #ifdef __WXMAC__
             if (is_metal_supported()) {
                 wxString metalPath = exePath + "../Resources/localjc_kernel.metal";
@@ -509,6 +510,7 @@ void JCCoordinator::CalcPseudoP()
             wxString clPath = exePath + "localjc_kernel.cl";
             flag = gpu_localjoincount(clPath.mb_str(), num_obs, permutations, last_seed_used, num_vars, zz, local_jc, w, _sigLocal);
 #endif
+            long gpu_time = sw_gpu.Time();
             
             delete[] values;
             
@@ -516,6 +518,30 @@ void JCCoordinator::CalcPseudoP()
                 wxMessageDialog dlg(NULL, "GeoDa can't configure GPU device. Default CPU solution will be used instead.", _("Error"), wxOK | wxICON_ERROR);
                 dlg.ShowModal();
                 CalcPseudoP_threaded(t);
+            } else {
+                // Benchmark CPU for comparison
+                std::vector<double> gpu_sig(num_obs);
+                for (int i=0; i<num_obs; ++i) gpu_sig[i] = _sigLocal[i];
+                wxStopWatch sw_cpu;
+                CalcPseudoP_threaded(t);
+                long cpu_time = sw_cpu.Time();
+                for (int i=0; i<num_obs; ++i) _sigLocal[i] = gpu_sig[i];
+
+                double speedup = (gpu_time > 0) ? ((double)cpu_time / (double)gpu_time) : 0.0;
+                int nCPUs = GdaConst::gda_set_cpu_cores ? GdaConst::gda_cpu_cores : wxThread::GetCPUCount();
+                wxString msg = wxString::Format(
+                    "⚡ Apple Metal GPU vs CPU Benchmark (Local Join Count)\n\n"
+                    "• Observations: %d\n"
+                    "• Permutations: %d\n"
+                    "• CPU Cores: %d\n\n"
+                    "⏱️ Apple Metal GPU:  %ld ms\n"
+                    "⏱️ CPU Multi-Core:   %ld ms\n\n"
+                    "🚀 GPU Speedup:      %.2fx %s",
+                    num_obs, permutations, nCPUs,
+                    gpu_time, cpu_time, speedup,
+                    (speedup >= 1.0) ? "faster!" : ""
+                );
+                wxMessageBox(msg, "GeoDa Metal Performance", wxOK | wxICON_INFORMATION);
             }
         }
     }
