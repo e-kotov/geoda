@@ -138,16 +138,14 @@ build-geoda-mac:
 		codesign -f -s - build/GeoDa.app/Contents/Frameworks/libwx_osx_cocoau_gl-3.2.dylib; \
 		codesign -f -s - build/GeoDa.app/Contents/Frameworks/libwx_osx_cocoau-3.2.0.3.0.dylib; \
 		codesign -f -s - build/GeoDa.app/Contents/Frameworks/libwx_osx_cocoau-3.2.dylib; \
-		codesign -f -s - build/GeoDa.app/Contents/MacOS/lisa_kernel.cl; \
-		codesign -f -s - build/GeoDa.app/Contents/MacOS/GeoDa; \
-		codesign -f -s - build/GeoDa.app; \
+		for f in build/GeoDa.app/Contents/MacOS/*; do codesign -f -s - "$$f"; done; \
+		codesign -f --deep -s - build/GeoDa.app; \
 	else \
 		codesign -f --timestamp -o runtime -s "$(CODESIGN_ID)" build/GeoDa.app/Contents/Frameworks/libwx_osx_cocoau_gl-3.2.dylib; \
 		codesign -f --timestamp -o runtime -s "$(CODESIGN_ID)" build/GeoDa.app/Contents/Frameworks/libwx_osx_cocoau-3.2.0.3.0.dylib; \
 		codesign -f --timestamp -o runtime -s "$(CODESIGN_ID)" build/GeoDa.app/Contents/Frameworks/libwx_osx_cocoau-3.2.dylib; \
-		codesign -f --timestamp -o runtime -s "$(CODESIGN_ID)" build/GeoDa.app/Contents/MacOS/lisa_kernel.cl; \
-		codesign -f --timestamp -o runtime -s "$(CODESIGN_ID)" build/GeoDa.app/Contents/MacOS/GeoDa; \
-		codesign -f --timestamp -o runtime -s "$(CODESIGN_ID)" build/GeoDa.app; \
+		for f in build/GeoDa.app/Contents/MacOS/*; do codesign -f --timestamp -o runtime -s "$(CODESIGN_ID)" "$$f"; done; \
+		codesign -f --deep --timestamp -o runtime -s "$(CODESIGN_ID)" build/GeoDa.app; \
 	fi
 
 	
