@@ -1,0 +1,40 @@
+name: CPU vs Metal GPU Benchmark
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 0' # Weekly run on Sundays
+
+jobs:
+  run_benchmark:
+    name: Permutation Benchmark (macos-15 Apple Silicon)
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: System Info
+        run: |
+          sysctl -n machdep.cpu.brand_string || true
+          sysctl -n hw.ncpu || true
+          arch
+          sw_vers
+
+      - name: Compile Benchmark Executable
+        run: |
+          clang++ -std=c++14 -O3 -ObjC++ -DSTANDALONE_TEST \
+            Algorithms/benchmark_lisa.mm \
+            Algorithms/metal_lisa.mm \
+            -framework Metal -framework Foundation \
+            -o Algorithms/benchmark_lisa
+
+      - name: Run Unattended Benchmark
+        run: |
+          ./Algorithms/benchmark_lisa Algorithms/lisa_kernel.metal
+
+      - name: Upload Benchmark CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-macos-15
+          path: benchmark-results.csv
