@@ -1,0 +1,106 @@
+name: Build & Publish Apple Silicon Pre-Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release Tag Name'
+        required: true
+        default: 'v1.22.1-metal-preview'
+  push:
+    tags:
+      - 'v*-metal*'
+
+jobs:
+  build_release_dmg:
+    name: Build macOS Apple Silicon DMG
+    runs-on: macos-15
+    permissions:
+      contents: write
+
+    env:
+      GEODA_VER: '1.22.1'
+      GEODA_ARCH: 'arm64'
+      RELEASE_TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install GDAL via Homebrew (arm64)
+        run: |
+          brew install gdal
+          sudo mkdir -p /usr/local/opt
+          sudo ln -s /opt/homebrew/opt/gdal /usr/local/opt/gdal
+          sudo ln -s /opt/homebrew/opt/proj /usr/local/opt/proj
+          GDAL_VERSION=$(gdal-config --version)
+          GDAL_MAJOR_VERSION=$(echo $GDAL_VERSION | cut -d. -f1)
+          GDAL_MINOR_VERSION=$(echo $GDAL_VERSION | cut -d. -f2)
+          echo "GDAL_VERSION=$GDAL_VERSION" >> $GITHUB_ENV
+          echo "GDAL_MAJOR_VERSION=$GDAL_MAJOR_VERSION" >> $GITHUB_ENV
+          echo "GDAL_DYLIB_NAME=libgdal.${GDAL_MAJOR_VERSION}${GDAL_MINOR_VERSION}.dylib" >> $GITHUB_ENV
+
+      - name: Cache Build Dependencies
+        uses: actions/cache@v4
+        id: cache
+        with:
+          path: |
+            BuildTools/macosx/libraries
+            BuildTools/macosx/temp
+          key: ${{ runner.os }}-arm64-deps-cache-${{ hashFiles('BuildTools/macosx/install.sh') }}
+
+      - name: Build Dependencies (if cache miss)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cd BuildTools/macosx
+          export GEODA_HOME=$PWD
+          export GEODA_ARCH=${{ env.GEODA_ARCH }}
+          ./install.sh
+
+      - name: Build GeoDa & Package DMG
+        run: |
+          mkdir -p o
+          cd BuildTools/macosx
+          export GEODA_HOME=$PWD
+          export GEODA_ARCH=${{ env.GEODA_ARCH }}
+          cp ../../GeoDamake.macosx.opt ../../GeoDamake.opt
+
+          VER_MAJOR=$(grep "const int version_major" $GEODA_HOME/../../version.h | sed -e 's/.*const int version_major = \([0-9]*\);.*/\1/')
+          VER_MINOR=$(grep "const int version_minor" $GEODA_HOME/../../version.h | sed -e 's/.*const int version_minor = \([0-9]*\);.*/\1/')
+          VER_BUILD=$(grep "const int version_build" $GEODA_HOME/../../version.h | sed -e 's/.*const int version_build = \([0-9]*\);.*/\1/')
+          GEODA_VERSION=$VER_MAJOR.$VER_MINOR.$VER_BUILD-$GEODA_ARCH
+          VER_STR="${VER_MAJOR}.${VER_MINOR}.${VER_BUILD}"
+
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VER_STR" GeoDa-GDAL-Info.plist || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VER_STR" GeoDa-GDAL-Info.plist || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VER_STR" GeoDa-Xcode-Info.plist || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VER_STR" GeoDa-Xcode-Info.plist || true
+
+          make -j$(sysctl -n hw.ncpu)
+          make app
+
+          cd create-dmg
+          ./geoda.sh $GEODA_VERSION
+          codesign -s - -i edu.uchicago.spatial GeoDa$GEODA_VERSION-Installer.dmg || true
+
+      - name: Upload DMG Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeoDa-AppleSilicon-Metal-DMG
+          path: ${{ github.workspace }}/BuildTools/macosx/create-dmg/GeoDa*-Installer.dmg
+
+      - name: Publish GitHub Pre-Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd BuildTools/macosx/create-dmg
+          DMG_FILE=$(ls GeoDa*-Installer.dmg | head -n 1)
+          TAG="${{ env.RELEASE_TAG }}"
+          echo "Publishing release $TAG with $DMG_FILE..."
+          gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1 && \
+            gh release upload "$TAG" "$DMG_FILE" --repo "${{ github.repository }}" --clobber || \
+            gh release create "$TAG" "$DMG_FILE" \
+              --repo "${{ github.repository }}" \
+              --prerelease \
+              --title "GeoDa Apple Metal Preview ($TAG)" \
+              --notes "GeoDa macOS Apple Silicon build with native Apple Metal GPU permutation acceleration."

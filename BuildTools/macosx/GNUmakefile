@@ -130,14 +130,25 @@ build-geoda-mac:
 	install_name_tool -change "$(GEODA_HOME)/libraries/lib/libwx_osx_cocoau-3.2.0.3.0.dylib" "@executable_path/../Frameworks/libwx_osx_cocoau-3.2.dylib" build/GeoDa.app/Contents/MacOS/GeoDa
 	install_name_tool -change "/usr/local/opt/gdal/lib/$(GDAL_DYLIB_NAME)" "@executable_path/../Frameworks/$(GDAL_DYLIB_NAME)" build/GeoDa.app/Contents/MacOS/GeoDa
 	install_name_tool -change "/opt/homebrew/opt/gdal/lib/$(GDAL_DYLIB_NAME)" "@executable_path/../Frameworks/$(GDAL_DYLIB_NAME)" build/GeoDa.app/Contents/MacOS/GeoDa
-	python3 install_name.py $(GEODA_HOME)/build/GeoDa.app/Contents/Frameworks "Developer ID Application: Geodapress LLC (26M5NG43GP)" $(GDAL_DYLIB_NAME)
+	$(eval CODESIGN_ID := $(shell security find-identity -v -p codesigning 2>/dev/null | grep "Developer ID Application: Geodapress LLC (26M5NG43GP)" >/dev/null 2>&1 && echo "Developer ID Application: Geodapress LLC (26M5NG43GP)" || echo "-"))
+	python3 install_name.py $(GEODA_HOME)/build/GeoDa.app/Contents/Frameworks "$(CODESIGN_ID)" $(GDAL_DYLIB_NAME)
 	install_name_tool -change "@executable_path/../Frameworks/libwx_osx_cocoau-3.2.0.3.0.dylib" "@executable_path/../Frameworks/libwx_osx_cocoau-3.2.dylib" build/GeoDa.app/Contents/Frameworks/libwx_osx_cocoau_gl-3.2.dylib
-	codesign -f --timestamp -o runtime -s "Developer ID Application: Geodapress LLC (26M5NG43GP)" build/GeoDa.app/Contents/Frameworks/libwx_osx_cocoau_gl-3.2.dylib
-	codesign -f --timestamp -o runtime -s "Developer ID Application: Geodapress LLC (26M5NG43GP)" build/GeoDa.app/Contents/Frameworks/libwx_osx_cocoau-3.2.0.3.0.dylib
-	codesign -f --timestamp -o runtime -s "Developer ID Application: Geodapress LLC (26M5NG43GP)" build/GeoDa.app/Contents/Frameworks/libwx_osx_cocoau-3.2.dylib
-	codesign -f --timestamp -o runtime -s "Developer ID Application: Geodapress LLC (26M5NG43GP)" build/GeoDa.app/Contents/MacOS/lisa_kernel.cl
-	codesign -f --timestamp -o runtime -s "Developer ID Application: Geodapress LLC (26M5NG43GP)" build/GeoDa.app/Contents/MacOS/GeoDa
-	codesign -f --timestamp -o runtime -s "Developer ID Application: Geodapress LLC (26M5NG43GP)" build/GeoDa.app
+	@if [ "$(CODESIGN_ID)" = "-" ]; then \
+		echo "Signing with ad-hoc identity..."; \
+		codesign -f -s - build/GeoDa.app/Contents/Frameworks/libwx_osx_cocoau_gl-3.2.dylib; \
+		codesign -f -s - build/GeoDa.app/Contents/Frameworks/libwx_osx_cocoau-3.2.0.3.0.dylib; \
+		codesign -f -s - build/GeoDa.app/Contents/Frameworks/libwx_osx_cocoau-3.2.dylib; \
+		codesign -f -s - build/GeoDa.app/Contents/MacOS/lisa_kernel.cl; \
+		codesign -f -s - build/GeoDa.app/Contents/MacOS/GeoDa; \
+		codesign -f -s - build/GeoDa.app; \
+	else \
+		codesign -f --timestamp -o runtime -s "$(CODESIGN_ID)" build/GeoDa.app/Contents/Frameworks/libwx_osx_cocoau_gl-3.2.dylib; \
+		codesign -f --timestamp -o runtime -s "$(CODESIGN_ID)" build/GeoDa.app/Contents/Frameworks/libwx_osx_cocoau-3.2.0.3.0.dylib; \
+		codesign -f --timestamp -o runtime -s "$(CODESIGN_ID)" build/GeoDa.app/Contents/Frameworks/libwx_osx_cocoau-3.2.dylib; \
+		codesign -f --timestamp -o runtime -s "$(CODESIGN_ID)" build/GeoDa.app/Contents/MacOS/lisa_kernel.cl; \
+		codesign -f --timestamp -o runtime -s "$(CODESIGN_ID)" build/GeoDa.app/Contents/MacOS/GeoDa; \
+		codesign -f --timestamp -o runtime -s "$(CODESIGN_ID)" build/GeoDa.app; \
+	fi
 
 	
 clean:

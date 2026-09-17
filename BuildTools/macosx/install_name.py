@@ -118,7 +118,10 @@ def process_dependency(framework_path, dylib_name):
             # process item
             process_dependency(framework_path, file_name)
     print("codesign {}", dylib_path)
-    cmd = f'codesign --force --timestamp -o runtime -s "{CODESIGN_ID}" {dylib_path}'
+    if CODESIGN_ID == "-":
+        cmd = f'codesign --force -s - {dylib_path}'
+    else:
+        cmd = f'codesign --force --timestamp -o runtime -s "{CODESIGN_ID}" {dylib_path}'
     os.system(cmd)
 
 
