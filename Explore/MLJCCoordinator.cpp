@@ -27,6 +27,9 @@
 #include <wx/msgdlg.h>
 
 #include "../Algorithms/gpu_lisa.h"
+#ifdef __WXMAC__
+#include "../Algorithms/metal_lisa.h"
+#endif
 #include "../DataViewer/TableInterface.h"
 #include "../ShapeOperations/Randik.h"
 #include "../ShapeOperations/WeightsManState.h"
@@ -485,13 +488,27 @@ void JCCoordinator::CalcPseudoP()
             GalElement* w = Gal_vecs[t]->gal;
             double* _sigLocal = sig_local_jc_vecs[t];
             
+            bool flag = false;
             wxString exePath = GenUtils::GetExeDir();
 #ifdef __WXMAC__
-            wxString clPath = exePath + "../Resources/localjc_kernel.cl";
+            if (is_metal_supported()) {
+                wxString metalPath = exePath + "../Resources/localjc_kernel.metal";
+                if (!wxFileName::FileExists(metalPath)) {
+                    metalPath = exePath + "localjc_kernel.metal";
+                }
+                flag = metal_localjoincount(metalPath.mb_str(), num_obs, permutations, last_seed_used, num_vars, zz, local_jc, w, _sigLocal);
+            }
+            if (!flag) {
+                wxString clPath = exePath + "../Resources/localjc_kernel.cl";
+                if (!wxFileName::FileExists(clPath)) {
+                    clPath = exePath + "localjc_kernel.cl";
+                }
+                flag = gpu_localjoincount(clPath.mb_str(), num_obs, permutations, last_seed_used, num_vars, zz, local_jc, w, _sigLocal);
+            }
 #else
             wxString clPath = exePath + "localjc_kernel.cl";
+            flag = gpu_localjoincount(clPath.mb_str(), num_obs, permutations, last_seed_used, num_vars, zz, local_jc, w, _sigLocal);
 #endif
-            bool flag = gpu_localjoincount(clPath.mb_str(), num_obs, permutations, last_seed_used, num_vars, zz, local_jc, w, _sigLocal);
             
             delete[] values;
             

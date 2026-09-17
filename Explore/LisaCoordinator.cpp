@@ -40,6 +40,9 @@
 #include "LisaCoordinator.h"
 
 #include "../Algorithms/gpu_lisa.h"
+#ifdef __WXMAC__
+#include "../Algorithms/metal_lisa.h"
+#endif
 
 /** 
  Since the user has the ability to synchronise either variable over time,
@@ -566,13 +569,27 @@ void LisaCoordinator::CalcPseudoP()
         GalElement* w = weights->gal;
         double* _sigLocal = sig_local_vecs[0];
         
+        bool flag = false;
         wxString exePath = GenUtils::GetExeDir();
 #ifdef __WXMAC__
-        wxString clPath = exePath + "../Resources/lisa_kernel.cl";
+        if (is_metal_supported()) {
+            wxString metalPath = exePath + "../Resources/lisa_kernel.metal";
+            if (!wxFileName::FileExists(metalPath)) {
+                metalPath = exePath + "lisa_kernel.metal";
+            }
+            flag = metal_lisa(metalPath.mb_str(), num_obs, permutations, last_seed_used, values, local_moran, w, _sigLocal);
+        }
+        if (!flag) {
+            wxString clPath = exePath + "../Resources/lisa_kernel.cl";
+            if (!wxFileName::FileExists(clPath)) {
+                clPath = exePath + "lisa_kernel.cl";
+            }
+            flag = gpu_lisa(clPath.mb_str(), num_obs, permutations, last_seed_used, values, local_moran, w, _sigLocal);
+        }
 #else
         wxString clPath = exePath + "lisa_kernel.cl";
+        flag = gpu_lisa(clPath.mb_str(), num_obs, permutations, last_seed_used, values, local_moran, w, _sigLocal);
 #endif
-        bool flag = gpu_lisa(clPath.mb_str(), num_obs, permutations, last_seed_used, values, local_moran, w, _sigLocal);
         
 		if (flag) {
 		   for (int cnt=0; cnt<num_obs; cnt++) {

@@ -84,6 +84,13 @@ build-geoda-mac:
 	cp $(GeoDa_ROOT)/BuildTools/CommonDistFiles/web_plugins/*.* build/GeoDa.app/Contents/Resources/web_plugins
 	cp $(GeoDa_ROOT)/BuildTools/CommonDistFiles/cache.sqlite build/GeoDa.app/Contents/Resources
 	cp $(GeoDa_ROOT)/Algorithms/lisa_kernel.cl build/GeoDa.app/Contents/MacOS
+	cp $(GeoDa_ROOT)/Algorithms/lisa_kernel.cl build/GeoDa.app/Contents/Resources
+	cp $(GeoDa_ROOT)/Algorithms/localjc_kernel.cl build/GeoDa.app/Contents/MacOS
+	cp $(GeoDa_ROOT)/Algorithms/localjc_kernel.cl build/GeoDa.app/Contents/Resources
+	cp $(GeoDa_ROOT)/Algorithms/lisa_kernel.metal build/GeoDa.app/Contents/MacOS
+	cp $(GeoDa_ROOT)/Algorithms/lisa_kernel.metal build/GeoDa.app/Contents/Resources
+	cp $(GeoDa_ROOT)/Algorithms/localjc_kernel.metal build/GeoDa.app/Contents/MacOS
+	cp $(GeoDa_ROOT)/Algorithms/localjc_kernel.metal build/GeoDa.app/Contents/Resources
 	cp -rf $(GeoDa_ROOT)/internationalization/lang build/GeoDa.app/Contents/Resources
 	$(LD) $(LDFLAGS) $(GeoDa_OBJ) $(LIBS) -o build/GeoDa.app/Contents/MacOS/GeoDa
 	cp GeoDa-GDAL-Info.plist build/GeoDa.app/Contents/Info.plist

@@ -1,0 +1,47 @@
+name: Apple Metal GPU Tests
+
+on:
+  push:
+    branches:
+      - master
+      - 'feature/**'
+      - 'metal**'
+    paths:
+      - 'Algorithms/**'
+      - '.github/workflows/metal_ci.yml'
+  pull_request:
+    paths:
+      - 'Algorithms/**'
+      - '.github/workflows/metal_ci.yml'
+  workflow_dispatch:
+
+jobs:
+  test_metal_gpu:
+    name: Metal GPU Permutations (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Check Apple Silicon Environment
+        run: |
+          uname -a
+          arch
+          sw_vers
+
+      - name: Build Standalone Metal Permutation Test
+        run: |
+          clang++ -std=c++14 -O3 -ObjC++ -DSTANDALONE_TEST \
+            Algorithms/test_metal_lisa.mm \
+            Algorithms/metal_lisa.mm \
+            -framework Metal -framework Foundation \
+            -o Algorithms/test_metal_lisa
+
+      - name: Run Metal Permutation Test on Apple Silicon GPU
+        run: |
+          ./Algorithms/test_metal_lisa Algorithms/lisa_kernel.metal Algorithms/localjc_kernel.metal
