@@ -2,12 +2,21 @@
 
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
+#import <IOKit/IOKitLib.h>
 #include "metal_lisa.h"
 #include <string>
 #include <fstream>
 #include <sstream>
 #include <iostream>
 #include <vector>
+#include <unordered_map>
+#include <mutex>
+
+static id<MTLDevice> s_device = nil;
+static id<MTLCommandQueue> s_commandQueue = nil;
+static std::unordered_map<int, id<MTLComputePipelineState>> s_lisa_pipeline_cache;
+static std::unordered_map<int, id<MTLComputePipelineState>> s_jc_pipeline_cache;
+static std::mutex s_metal_mutex;
 
 bool is_metal_supported()
 {
@@ -17,17 +26,67 @@ bool is_metal_supported()
     }
 }
 
+int get_metal_gpu_core_count()
+{
+    static int cached_cores = 0;
+    if (cached_cores > 0) return cached_cores;
+    int cores = 0;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AGXAccelerator"));
+    if (!service) {
+        service = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("AGXAccelerator"));
+    }
+#pragma clang diagnostic pop
+    if (service) {
+        CFNumberRef prop = (CFNumberRef)IORegistryEntryCreateCFProperty(service, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0);
+        if (prop) {
+            CFNumberGetValue(prop, kCFNumberIntType, &cores);
+            CFRelease(prop);
+        }
+        IOObjectRelease(service);
+    }
+    cached_cores = cores;
+    return cores;
+}
+
+const char* get_metal_device_name()
+{
+    static std::string dev_name;
+    if (dev_name.empty()) {
+        @autoreleasepool {
+            id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+            if (device) {
+                dev_name = [device.name UTF8String];
+            } else {
+                dev_name = "Apple Silicon GPU";
+            }
+        }
+    }
+    return dev_name.c_str();
+}
+
 bool metal_lisa(const char* metal_path, int rows, int permutations, unsigned long long last_seed_used,
                 double* values, double* local_moran, GalElement* w, double* p)
 {
     if (rows <= 0) return false;
 
     @autoreleasepool {
-        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        std::lock_guard<std::mutex> lock(s_metal_mutex);
+        if (!s_device) {
+            s_device = MTLCreateSystemDefaultDevice();
+        }
+        id<MTLDevice> device = s_device;
         if (!device) {
             std::cerr << "Metal: No default device found.\n";
             return false;
         }
+
+        if (!s_commandQueue) {
+            s_commandQueue = [device newCommandQueue];
+        }
+        id<MTLCommandQueue> commandQueue = s_commandQueue;
+        if (!commandQueue) return false;
 
         int max_n_nbrs = 0;
         std::vector<int> num_nbrs(rows, 0);
@@ -53,49 +112,53 @@ bool metal_lisa(const char* metal_path, int rows, int permutations, unsigned lon
             }
         }
 
-        // Read shader source
-        std::ifstream t(metal_path);
-        std::stringstream buffer;
-        buffer << t.rdbuf();
-        std::string src_code = buffer.str();
-        if (src_code.empty()) {
-            std::cerr << "Metal: Could not read kernel from " << metal_path << "\n";
-            return false;
-        }
-
-        // Replace buffer size marker '123' with max_n_nbrs * 2 (at least 64)
         int buf_size = (max_n_nbrs * 2 < 64) ? 64 : (max_n_nbrs * 2);
-        std::string target = "123";
-        std::string replacement = std::to_string(buf_size);
-        size_t pos = 0;
-        while ((pos = src_code.find(target, pos)) != std::string::npos) {
-            src_code.replace(pos, target.length(), replacement);
-            pos += replacement.length();
-        }
+        id<MTLComputePipelineState> pipelineState = nil;
+        auto it = s_lisa_pipeline_cache.find(buf_size);
+        if (it != s_lisa_pipeline_cache.end()) {
+            pipelineState = it->second;
+        } else {
+            // Read shader source
+            std::ifstream t(metal_path);
+            std::stringstream buffer;
+            buffer << t.rdbuf();
+            std::string src_code = buffer.str();
+            if (src_code.empty()) {
+                std::cerr << "Metal: Could not read kernel from " << metal_path << "\n";
+                return false;
+            }
 
-        NSError *error = nil;
-        NSString *sourceStr = [NSString stringWithUTF8String:src_code.c_str()];
-        MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
-        id<MTLLibrary> library = [device newLibraryWithSource:sourceStr options:options error:&error];
-        if (!library) {
-            std::cerr << "Metal compile error: " << [[error localizedDescription] UTF8String] << "\n";
-            return false;
-        }
+            // Replace buffer size marker '123' with max_n_nbrs * 2 (at least 64)
+            std::string target = "123";
+            std::string replacement = std::to_string(buf_size);
+            size_t pos = 0;
+            while ((pos = src_code.find(target, pos)) != std::string::npos) {
+                src_code.replace(pos, target.length(), replacement);
+                pos += replacement.length();
+            }
 
-        id<MTLFunction> kernelFunc = [library newFunctionWithName:@"lisa_metal"];
-        if (!kernelFunc) {
-            std::cerr << "Metal: Kernel function 'lisa_metal' not found.\n";
-            return false;
-        }
+            NSError *error = nil;
+            NSString *sourceStr = [NSString stringWithUTF8String:src_code.c_str()];
+            MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+            id<MTLLibrary> library = [device newLibraryWithSource:sourceStr options:options error:&error];
+            if (!library) {
+                std::cerr << "Metal compile error: " << [[error localizedDescription] UTF8String] << "\n";
+                return false;
+            }
 
-        id<MTLComputePipelineState> pipelineState = [device newComputePipelineStateWithFunction:kernelFunc error:&error];
-        if (!pipelineState) {
-            std::cerr << "Metal pipeline state error: " << [[error localizedDescription] UTF8String] << "\n";
-            return false;
-        }
+            id<MTLFunction> kernelFunc = [library newFunctionWithName:@"lisa_metal"];
+            if (!kernelFunc) {
+                std::cerr << "Metal: Kernel function 'lisa_metal' not found.\n";
+                return false;
+            }
 
-        id<MTLCommandQueue> commandQueue = [device newCommandQueue];
-        if (!commandQueue) return false;
+            pipelineState = [device newComputePipelineStateWithFunction:kernelFunc error:&error];
+            if (!pipelineState) {
+                std::cerr << "Metal pipeline state error: " << [[error localizedDescription] UTF8String] << "\n";
+                return false;
+            }
+            s_lisa_pipeline_cache[buf_size] = pipelineState;
+        }
 
         // Convert double arrays to float for Apple Silicon GPU
         std::vector<float> values_f(rows);
@@ -157,11 +220,21 @@ bool metal_localjoincount(const char* metal_path, int rows, int permutations, un
     if (rows <= 0) return false;
 
     @autoreleasepool {
-        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        std::lock_guard<std::mutex> lock(s_metal_mutex);
+        if (!s_device) {
+            s_device = MTLCreateSystemDefaultDevice();
+        }
+        id<MTLDevice> device = s_device;
         if (!device) {
             std::cerr << "Metal: No default device found.\n";
             return false;
         }
+
+        if (!s_commandQueue) {
+            s_commandQueue = [device newCommandQueue];
+        }
+        id<MTLCommandQueue> commandQueue = s_commandQueue;
+        if (!commandQueue) return false;
 
         int max_n_nbrs = 0;
         std::vector<unsigned short> num_nbrs(rows, 0);
@@ -194,48 +267,52 @@ bool metal_localjoincount(const char* metal_path, int rows, int permutations, un
             local_jc_us[i] = (unsigned short)local_jc[i];
         }
 
-        // Read shader source
-        std::ifstream t(metal_path);
-        std::stringstream buffer;
-        buffer << t.rdbuf();
-        std::string src_code = buffer.str();
-        if (src_code.empty()) {
-            std::cerr << "Metal: Could not read kernel from " << metal_path << "\n";
-            return false;
-        }
-
         int buf_size = (max_n_nbrs * 2 < 64) ? 64 : (max_n_nbrs * 2);
-        std::string target = "123";
-        std::string replacement = std::to_string(buf_size);
-        size_t pos = 0;
-        while ((pos = src_code.find(target, pos)) != std::string::npos) {
-            src_code.replace(pos, target.length(), replacement);
-            pos += replacement.length();
-        }
+        id<MTLComputePipelineState> pipelineState = nil;
+        auto it = s_jc_pipeline_cache.find(buf_size);
+        if (it != s_jc_pipeline_cache.end()) {
+            pipelineState = it->second;
+        } else {
+            // Read shader source
+            std::ifstream t(metal_path);
+            std::stringstream buffer;
+            buffer << t.rdbuf();
+            std::string src_code = buffer.str();
+            if (src_code.empty()) {
+                std::cerr << "Metal: Could not read kernel from " << metal_path << "\n";
+                return false;
+            }
 
-        NSError *error = nil;
-        NSString *sourceStr = [NSString stringWithUTF8String:src_code.c_str()];
-        MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
-        id<MTLLibrary> library = [device newLibraryWithSource:sourceStr options:options error:&error];
-        if (!library) {
-            std::cerr << "Metal compile error: " << [[error localizedDescription] UTF8String] << "\n";
-            return false;
-        }
+            std::string target = "123";
+            std::string replacement = std::to_string(buf_size);
+            size_t pos = 0;
+            while ((pos = src_code.find(target, pos)) != std::string::npos) {
+                src_code.replace(pos, target.length(), replacement);
+                pos += replacement.length();
+            }
 
-        id<MTLFunction> kernelFunc = [library newFunctionWithName:@"localjc_metal"];
-        if (!kernelFunc) {
-            std::cerr << "Metal: Kernel function 'localjc_metal' not found.\n";
-            return false;
-        }
+            NSError *error = nil;
+            NSString *sourceStr = [NSString stringWithUTF8String:src_code.c_str()];
+            MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+            id<MTLLibrary> library = [device newLibraryWithSource:sourceStr options:options error:&error];
+            if (!library) {
+                std::cerr << "Metal compile error: " << [[error localizedDescription] UTF8String] << "\n";
+                return false;
+            }
 
-        id<MTLComputePipelineState> pipelineState = [device newComputePipelineStateWithFunction:kernelFunc error:&error];
-        if (!pipelineState) {
-            std::cerr << "Metal pipeline state error: " << [[error localizedDescription] UTF8String] << "\n";
-            return false;
-        }
+            id<MTLFunction> kernelFunc = [library newFunctionWithName:@"localjc_metal"];
+            if (!kernelFunc) {
+                std::cerr << "Metal: Kernel function 'localjc_metal' not found.\n";
+                return false;
+            }
 
-        id<MTLCommandQueue> commandQueue = [device newCommandQueue];
-        if (!commandQueue) return false;
+            pipelineState = [device newComputePipelineStateWithFunction:kernelFunc error:&error];
+            if (!pipelineState) {
+                std::cerr << "Metal pipeline state error: " << [[error localizedDescription] UTF8String] << "\n";
+                return false;
+            }
+            s_jc_pipeline_cache[buf_size] = pipelineState;
+        }
 
         unsigned long u_num_vars = (unsigned long)num_vars;
 

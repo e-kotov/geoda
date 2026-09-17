@@ -630,15 +630,27 @@ void LisaCoordinator::CalcPseudoP()
 
            double speedup = (gpu_time > 0) ? ((double)cpu_time / (double)gpu_time) : 0.0;
            int nCPUs = GdaConst::gda_set_cpu_cores ? GdaConst::gda_cpu_cores : wxThread::GetCPUCount();
+           wxString gpu_info = "Apple Silicon GPU";
+#ifdef __WXMAC__
+           int nGPUs = get_metal_gpu_core_count();
+           const char* dev_name = get_metal_device_name();
+           if (nGPUs > 0) {
+               gpu_info = wxString::Format("%s (%d GPU Cores)", dev_name, nGPUs);
+           } else {
+               gpu_info = wxString::Format("%s", dev_name);
+           }
+#endif
            wxString msg = wxString::Format(
                "⚡ Apple Metal GPU vs CPU Benchmark (Local Moran)\n\n"
                "• Observations: %d\n"
                "• Permutations: %d\n"
-               "• CPU Cores: %d\n\n"
+               "• GPU: %s\n"
+               "• CPU: %d Cores Multi-Threaded\n\n"
                "⏱️ Apple Metal GPU:  %ld ms\n"
                "⏱️ CPU Multi-Core:   %ld ms\n\n"
                "🚀 GPU Speedup:      %.2fx %s",
-               num_obs, permutations, nCPUs,
+               num_obs, permutations,
+               gpu_info, nCPUs,
                gpu_time, cpu_time, speedup,
                (speedup >= 1.0) ? "faster!" : ""
            );

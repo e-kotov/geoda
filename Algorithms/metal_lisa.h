@@ -20,6 +20,8 @@ public:
 #ifdef __APPLE__
 
 bool is_metal_supported();
+int get_metal_gpu_core_count();
+const char* get_metal_device_name();
 
 bool metal_lisa(const char* metal_path, int rows, int permutations, unsigned long long last_seed_used,
                 double* values, double* local_moran, GalElement* w, double* p);

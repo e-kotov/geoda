@@ -16,7 +16,7 @@ LIBS	=	$(WXLIBS) \
             $(GEODA_HOME)/temp/CLAPACK-3.2.1/lapack.a \
             -L/usr/lib -liconv -lcurl -lz -lpthread \
 			-framework OpenCL \
-			-framework Metal -framework Foundation \
+			-framework Metal -framework Foundation -framework IOKit \
             -L/usr/local/opt/gdal/lib -lgdal \
             $(GEODA_HOME)/libraries/lib/libboost_date_time.a \
             $(GEODA_HOME)/libraries/lib/libboost_thread.a \
