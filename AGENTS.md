@@ -75,8 +75,9 @@ regenerate with `Rscript Algorithms/make_test_data.R` (needs R package `sf`).
 - Apple Silicon only (`MTLGPUFamilyApple7`, i.e. M1 and later); Intel Macs keep using OpenCL.
 - No fp64 on Apple GPUs: doubles are passed as (high, low) float pairs, sums use TwoSum,
   kernels are compiled with fast math **off**. Permutations tied with the observed value
-  (difference below `tie_tol`) are never counted as larger; the CPU decides such ties by
-  roundoff, which the test accounts for.
+  (difference below `tie_tol`) always count as larger, as the CPU's `>=` in
+  `LisaCoordinator::ComputeLarger()` intends (note: the OpenCL kernel uses `>`); the CPU
+  decides such ties by roundoff, which the test accounts for. Row-standardized weights are assumed.
 - Kernels return counts; p-values are computed on the host in double, otherwise
   `p <= 0.001` style significance categories break.
 - Scope: all OpenCL code that GeoDa actually calls is covered (`gpu_lisa`,

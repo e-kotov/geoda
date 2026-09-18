@@ -8,8 +8,8 @@
 // AbstractCoordinator::CalcPseudoP_range() / JCCoordinator::CalcPseudoP_range().
 // 1. With the random sequence of observation i starting at seed + i (what the GPU
 //    does), GPU and CPU draw the same permutations, so pseudo p-values must be equal.
-//    The only exception are permutations tied with the observed Local Moran: there
-//    the CPU result depends on roundoff, while the GPU never counts a tie as larger.
+//    The only exception are permutations tied with the observed Local Moran: they
+//    count as larger (>=), but on the CPU that depends on roundoff, on the GPU it doesn't.
 // 2. With one sequential random sequence (what single threaded GeoDa does), pseudo
 //    p-values must agree within Monte Carlo error.
 #include <algorithm>
@@ -94,12 +94,12 @@ static void cpu_reference(bool is_jc, bool per_obs_seed, int n, int permutations
                 if (lag >= local_sa[i]) count_larger++;
             } else {
                 double permuted = lag / num_nbrs * x[i];
-                if (permuted > local_sa[i]) count_larger++;
+                if (permuted >= local_sa[i]) count_larger++; // LisaCoordinator::ComputeLarger()
                 // same test with ties decided exactly
                 // (difference of the sums of neighbors is a roundoff error, see metal_lisa())
                 bool tie = x[i] == 0 || fabs(lag - local_sa[i] * num_nbrs / x[i]) <= tie_tol;
                 if (tie) ties++;
-                else if (permuted > local_sa[i]) count_larger_no_ties++;
+                if (tie || permuted > local_sa[i]) count_larger_no_ties++;
             }
         }
         if (p_no_ties) {

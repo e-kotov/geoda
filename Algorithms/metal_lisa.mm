@@ -146,8 +146,8 @@ bool metal_lisa(const char* metal_path, int rows, int permutations, unsigned lon
     if (!metal_num_nbrs(rows, w, true, num_nbrs, max_nbrs)) return false;
 
     // No fp64 on Apple GPUs: pass each double as a (high, low) pair of floats.
-    // permuted lag * values[i] > local_moran[i] is tested in the kernel as
-    // sum of permuted neighbors >(<) lag_sum[i] for positive (negative) values[i]
+    // permuted lag * values[i] >= local_moran[i] (row-standardized weights) is tested in
+    // the kernel as sum of permuted neighbors >=(<=) lag_sum[i] for positive (negative) values[i]
     std::vector<float> val(rows), val_lo(rows), lag_sum(rows, 0), lag_sum_lo(rows, 0);
     double max_abs = 1;
     for (int i = 0; i < rows; i++) {

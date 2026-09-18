@@ -18,8 +18,9 @@ inline int ThomasWangHashIndex(ulong key, ulong max_rand)
 // There is no fp64 on Apple GPUs: a double x is passed as the pair of floats
 // (x, x_lo) with x + x_lo == x up to 48 bits, and the permuted lag is accumulated
 // as such pair (requires compiling without fast math).
-// local_moran_permuted > local_moran is tested as sum of permuted neighbors vs
-// lag_sum = the observed sum of neighbors; differences below tie_tol are ties.
+// local_moran_permuted >= local_moran (as in LisaCoordinator::ComputeLarger) is tested
+// as sum of permuted neighbors vs lag_sum = the observed sum of neighbors; differences
+// below tie_tol are ties.
 kernel void lisa_metal(
     constant int &n                       [[buffer(0)]],
     constant int &permutations            [[buffer(1)]],
@@ -104,7 +105,7 @@ kernel void lisa_metal(
 #endif
 
         float diff = (permutedLag - lag_sum[i]) + (permutedLag_lo - lag_sum_lo[i]);
-        if ((values[i] > 0 && diff > tie_tol) || (values[i] < 0 && diff < -tie_tol)) {
+        if ((values[i] > 0 && diff >= -tie_tol) || (values[i] < 0 && diff <= tie_tol) || values[i] == 0) {
             countLarger++;
         }
     }
