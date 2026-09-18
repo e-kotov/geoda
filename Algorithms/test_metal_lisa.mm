@@ -57,13 +57,7 @@ static void cpu_reference(bool is_jc, bool per_obs_seed, int n, int permutations
 {
     int max_rand = n - 1;
     uint64_t seed_start = seed;
-    double max_abs = 1;
-    size_t max_nbrs = 0;
-    for (int i = 0; i < n; i++) {
-        max_abs = std::max(max_abs, fabs(x[i]));
-        max_nbrs = std::max(max_nbrs, (size_t)w[i].Size());
-    }
-    const double tie_tol = (float)(1e-11 * max_abs * (max_nbrs + 1));
+    const double tie_tol = 1e-13; // relative to the sum of absolute values, see metal_lisa()
     std::vector<bool> drawn(n, false);
     std::vector<int> perm_nbrs;
 
@@ -85,9 +79,10 @@ static void cpu_reference(bool is_jc, bool per_obs_seed, int n, int permutations
                     perm_nbrs.push_back(r);
                 }
             }
-            double lag = 0;
+            double lag = 0, lag_abs = 0;
             for (int j = num_nbrs - 1; j >= 0; j--) { // GeoDaSet::Pop() order
                 lag += x[perm_nbrs[j]];
+                lag_abs += fabs(x[perm_nbrs[j]]);
                 drawn[perm_nbrs[j]] = false;
             }
             if (is_jc) {
@@ -97,7 +92,8 @@ static void cpu_reference(bool is_jc, bool per_obs_seed, int n, int permutations
                 if (permuted >= local_sa[i]) count_larger++; // LisaCoordinator::ComputeLarger()
                 // same test with ties decided exactly
                 // (difference of the sums of neighbors is a roundoff error, see metal_lisa())
-                bool tie = x[i] == 0 || fabs(lag - local_sa[i] * num_nbrs / x[i]) <= tie_tol;
+                double obs_sum = x[i] == 0 ? 0 : local_sa[i] * num_nbrs / x[i];
+                bool tie = x[i] == 0 || fabs(lag - obs_sum) <= tie_tol * (lag_abs + fabs(obs_sum));
                 if (tie) ties++;
                 if (tie || permuted > local_sa[i]) count_larger_no_ties++;
             }

@@ -20,7 +20,7 @@ inline int ThomasWangHashIndex(ulong key, ulong max_rand)
 // as such pair (requires compiling without fast math).
 // local_moran_permuted >= local_moran (as in LisaCoordinator::ComputeLarger) is tested
 // as sum of permuted neighbors vs lag_sum = the observed sum of neighbors; differences
-// below tie_tol are ties.
+// below tie_tol relative to the sum of absolute values are ties.
 kernel void lisa_metal(
     constant int &n                       [[buffer(0)]],
     constant int &permutations            [[buffer(1)]],
@@ -62,7 +62,7 @@ kernel void lisa_metal(
 
     for (int perm = 0; perm < permutations; perm++) {
         int rand = 0;
-        float permutedLag = 0.0f, permutedLag_lo = 0.0f;
+        float permutedLag = 0.0f, permutedLag_lo = 0.0f, sumAbs = 0.0f;
 
         while (rand < numNeighbors) {
             int newRandom = ThomasWangHashIndex(seed_start++, max_rand);
@@ -90,6 +90,7 @@ kernel void lisa_metal(
                     float err = (permutedLag - (s - t)) + (values[newRandom] - t);
                     permutedLag = s;
                     permutedLag_lo += err + values_lo[newRandom];
+                    sumAbs += fabs(values[newRandom]);
 #if MAX_NBRS > 128
                     drawn[slot] = newRandom;
                     used_slots[rand] = slot;
@@ -105,7 +106,8 @@ kernel void lisa_metal(
 #endif
 
         float diff = (permutedLag - lag_sum[i]) + (permutedLag_lo - lag_sum_lo[i]);
-        if ((values[i] > 0 && diff >= -tie_tol) || (values[i] < 0 && diff <= tie_tol) || values[i] == 0) {
+        float tol = tie_tol * (sumAbs + fabs(lag_sum[i])); // roundoff is relative to the summands
+        if ((values[i] > 0 && diff >= -tol) || (values[i] < 0 && diff <= tol) || values[i] == 0) {
             countLarger++;
         }
     }

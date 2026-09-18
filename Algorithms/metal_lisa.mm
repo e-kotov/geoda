@@ -151,19 +151,25 @@ bool metal_lisa(const char* metal_path, int rows, int permutations, unsigned lon
     // permuted lag * values[i] >= local_moran[i] (row-standardized weights) is tested in
     // the kernel as sum of permuted neighbors >=(<=) lag_sum[i] for positive (negative) values[i]
     std::vector<float> val(rows), val_lo(rows), lag_sum(rows, 0), lag_sum_lo(rows, 0);
-    double max_abs = 1;
+    // values are scaled to [-1, 1] (the test is scale invariant): any magnitude fits a float
+    double max_abs = 0;
     for (int i = 0; i < rows; i++) {
-        val[i] = (float)values[i];
-        val_lo[i] = (float)(values[i] - val[i]);
         if (fabs(values[i]) > max_abs) max_abs = fabs(values[i]);
-        if (val[i] != 0) {
-            double s = local_moran[i] * num_nbrs[i] / values[i];
+    }
+    if (max_abs == 0) max_abs = 1;
+    for (int i = 0; i < rows; i++) {
+        double v = values[i] / max_abs;
+        val[i] = (float)v;
+        val_lo[i] = (float)(v - val[i]);
+        if (values[i] != 0) {
+            double s = local_moran[i] * num_nbrs[i] / values[i] / max_abs;
             lag_sum[i] = (float)s;
             lag_sum_lo[i] = (float)(s - lag_sum[i]);
         }
     }
-    // differences from the observed value below this are roundoff errors, i.e. ties
-    float tie_tol = (float)(1e-11 * max_abs * (max_nbrs + 1));
+    // differences from the observed value below this (relative to the sum of absolute values)
+    // are roundoff errors, i.e. ties: float pairs carry 48 bits, 3.6e-15
+    float tie_tol = 1e-13f;
 
     std::vector<MetalInput> inputs;
     inputs.push_back(MetalInput(val.data(), sizeof(float)*rows));
