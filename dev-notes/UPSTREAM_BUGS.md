@@ -56,6 +56,7 @@ The essential code and numbers are inlined below so that this document stands on
 | GPU-4 | the GPU branch ignores `reuse_last_seed == false` | desktop (GPU) | CONFIRMED | same | medium | no |
 | GPU-5 | macOS bundle installs the kernels next to the binary, the code loads them from `Resources` | desktop (GPU) | CONFIRMED | every macOS release user who turns the GPU on | medium (the GPU option cannot work) | no |
 | GPU-6 | dead `gpu_distmatrix()`: 6 arguments set on a 4-argument kernel | desktop | COSMETIC-OR-DEAD-CODE | nobody | n/a | no |
+| GPU-7 | GPU seeding `seed_start = i + last_seed`: all observations share their Monte Carlo noise | desktop (OpenCL kernels, copied by the Metal port) | CONFIRMED by replay (`dev-notes/repro/gpu7_shared_noise/`) | every GPU run | medium: no bias, but the map is 2.5 to 4.8 times less stable between seeds than the CPU's | planned (re-keying of the four kernels) |
 | LG-1 | libgeoda counts a self-link in the permutation size but not in the observed statistic | libgeoda | CONFIRMED | **rgeoda/pygeoda, any kernel weights** | medium (anti-conservative p-values) | no |
 | LG-2 | `row_standardize` is dead in libgeoda too; `UniG`/`UniGstar` would degenerate | libgeoda | CONFIRMED-LATENT | nobody | n/a | no |
 | LG-3 | NaN observed statistic, and NaN contagion into the cluster map | libgeoda | CONFIRMED | rgeoda with self-only or fully-undefined neighbourhoods | medium | no |
@@ -830,6 +831,57 @@ their project references, or fix the indices if the function is meant to be revi
 
 ---
 
+## GPU-7 — the GPU seeding makes all observations share their Monte Carlo noise
+
+**Code.** Upstream `Algorithms/lisa_kernel.cl` and `Algorithms/localjc_kernel.cl` start the random sequence of
+observation `i` at
+
+```c
+    size_t seed_start = i + last_seed;
+```
+
+and then consume one key per draw (`ThomasWangHashDouble(seed_start++)`), rejected draws included. The CPU code does
+something else: one counter per *thread*, started at `last_seed_used + a` for the thread's first observation `a` and
+running on through all its observations (`Explore/AbstractCoordinator.cpp:470`, `:545`). The OpenCL fixes and the
+Metal port on this branch kept the kernel's line, because their tests compare the kernels with the CPU *algorithm*
+fed with the same keys.
+
+**Consequence.** Observation `i` reads the keys `seed + i, seed + i + 1, ...`, about `P * k` of them; observation
+`i + 1` reads the same keys shifted by one. Every observation within `P * k` index positions (4,000 for 999
+permutations and 4 neighbours: usually the whole data set) is therefore compared with nearly the same random sample.
+Each pseudo p-value is still valid on its own and nothing is biased, but the noise of different observations is no
+longer independent and does not average out over the map.
+
+**Evidence.** `dev-notes/repro/gpu7_shared_noise/` (tracked, standalone C++, 2 minutes): data without spatial
+structure, fixed data, 200 seeds, 5 data sets per row, 999 permutations. Seed-to-seed standard deviation of the number
+of observations with p <= 0.05, relative to independent noise:
+
+| n | GPU seeding | desktop CPU (10 threads) | keys per (seed, observation, permutation) |
+|--:|--:|--:|--:|
+| 900 | 2.46 [2.18, 2.61] | 1.04 | 1.01 |
+| 3,600 | 4.05 [3.94, 4.21] | 1.05 | 1.02 |
+| 10,000 | 4.82 [4.54, 5.17] | 1.04 | 1.02 |
+| 3,600, 3..8 neighbours | 3.63 [3.38, 3.80] | 1.07 | 0.98 |
+
+In counts: at n = 3,600 about 357 observations are significant; from seed to seed that number moves by +-21 with the
+GPU seeding and by +-5 with the CPU code. The excess grows with n. The GPU path is statistically worse than the CPU
+path it replaces, although both run the same number of permutations.
+
+**Reachability.** Every GPU run (OpenCL upstream once GPU-2/GPU-3 are fixed; Metal on this branch). CONFIRMED by
+replay; not yet measured on the kernels themselves.
+
+**Proposed fix.** Start every permutation `q` of observation `i` from its own key,
+`hash(hash(seed + i) + q)`, and keep everything else (draw, rejection, comparison). Permutations become independent
+of each other, which also allows splitting a long run into several GPU dispatches without changing the result. The
+CPU code is not touched: its results stay as they are. GPU results for a given seed change; the GPU path is off by
+default and the OpenCL path did not work before this branch, so nobody depends on those numbers.
+
+**Testing.** The host reference in `Algorithms/test_metal_lisa.mm` replays the kernel's keys, so it changes with the
+kernel and the GPU == reference tests stay exact. New: the result must not depend on how the permutations are split
+into dispatches; the shared-noise measurement repeated on the real kernels, before and after.
+
+---
+
 ## LG-1 — libgeoda counts a self-link in the permutation size but not in the observed statistic
 
 **This is the entry that matters most for rgeoda/pygeoda: it is reachable today, with default
@@ -1156,6 +1208,11 @@ start" — and four of the six are already implemented on this branch
 (`cfceee2b`, `04529b11`, `30faf4ff`). GPU-4 and GPU-5 are one-liners that belong with them. This
 is the PR the Metal work already implies; GPU-5 in particular should be mentioned because it
 explains why nobody would have noticed the rest on a Mac.
+**GPU-7 changes THEIR design, not a bug in the usual sense, so it needs its own argument:** put it in the
+OpenCL PR as a separate commit (or a separate PR right after it) whose description is the GPU-7 entry: the
+two-line explanation of the shifted keys, the table, and `dev-notes/repro/gpu7_shared_noise/shared_noise.cpp`
+attached so that a maintainer can rerun it in two minutes without GeoDa. The Metal PR must use the same keys as the
+OpenCL kernels, so the order is: OpenCL fixes incl. GPU-7 first, or both in one PR.
 
 **PR 6 — desktop: time-period handling in the shared draw (A, B).** Same function, same reviewer
 context, both need the maintainer to confirm the intended semantics. Do not bundle with anything
@@ -1224,6 +1281,7 @@ or reject wholesale. Keep G's one-line fix in it even though the caller is comme
 | `libgeoda_repro/` | LG-1, LG-2, LG-3, LG-5, LOSH-1 | `bash build.sh` (compiles libgeoda read-only) |
 | `r_repro/` | LG-1 at R level, D reachability | `Rscript 01_checks.R` etc., private library in `../Rlib` |
 | `patches/` | proposed fixes, **not applied** | see `patches/README.md` |
+| **tracked:** `dev-notes/repro/gpu7_shared_noise/` | GPU-7 | `clang++ -O2 -std=c++14 shared_noise.cpp -o shared_noise && ./shared_noise` |
 
 All patches are written against **upstream `master`** (`f7696a4b`) for the geoda files and against
 the libgeoda submodule as checked out here. Verified to apply with `git apply --check` from the
