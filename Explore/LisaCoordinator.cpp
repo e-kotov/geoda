@@ -40,9 +40,7 @@
 #include "LisaCoordinator.h"
 
 #include "../Algorithms/gpu_lisa.h"
-#ifdef __WXMAC__
 #include "../Algorithms/metal_lisa.h"
-#endif
 
 /** 
  Since the user has the ability to synchronise either variable over time,
@@ -569,29 +567,19 @@ void LisaCoordinator::CalcPseudoP()
         GalElement* w = weights->gal;
         double* _sigLocal = sig_local_vecs[0];
         
-        bool flag = false;
         wxString exePath = GenUtils::GetExeDir();
-        wxStopWatch sw_gpu;
 #ifdef __WXMAC__
-        if (is_metal_supported()) {
-            wxString metalPath = exePath + "../Resources/lisa_kernel.metal";
-            if (!wxFileName::FileExists(metalPath)) {
-                metalPath = exePath + "lisa_kernel.metal";
-            }
-            flag = metal_lisa(metalPath.mb_str(), num_obs, permutations, last_seed_used, values, local_moran, w, _sigLocal);
-        }
-        if (!flag) {
-            wxString clPath = exePath + "../Resources/lisa_kernel.cl";
-            if (!wxFileName::FileExists(clPath)) {
-                clPath = exePath + "lisa_kernel.cl";
-            }
-            flag = gpu_lisa(clPath.mb_str(), num_obs, permutations, last_seed_used, values, local_moran, w, _sigLocal);
-        }
+        wxString clPath = exePath + "../Resources/lisa_kernel.cl";
 #else
         wxString clPath = exePath + "lisa_kernel.cl";
-        flag = gpu_lisa(clPath.mb_str(), num_obs, permutations, last_seed_used, values, local_moran, w, _sigLocal);
 #endif
-        long gpu_time = sw_gpu.Time();
+        bool flag = false;
+#ifdef __WXMAC__
+        // Apple Metal first: OpenCL is deprecated on macOS
+        wxString metalPath = exePath + "../Resources/lisa_kernel.metal";
+        flag = metal_lisa(metalPath.mb_str(), num_obs, permutations, last_seed_used, values, local_moran, w, _sigLocal);
+#endif
+        if (!flag) flag = gpu_lisa(clPath.mb_str(), num_obs, permutations, last_seed_used, values, local_moran, w, _sigLocal);
         
 		if (flag) {
 		   for (int cnt=0; cnt<num_obs; cnt++) {
@@ -608,53 +596,6 @@ void LisaCoordinator::CalcPseudoP()
                    _sigCat[cnt] = 6;
                }
            }
-
-           // Benchmark CPU for comparison
-           std::vector<double> gpu_sigLocal(num_obs);
-           std::vector<int> gpu_sigCat(num_obs);
-           int* _sigCat = sig_cat_vecs[0];
-           for (int i=0; i<num_obs; ++i) {
-               gpu_sigLocal[i] = _sigLocal[i];
-               gpu_sigCat[i] = _sigCat[i];
-           }
-
-           wxStopWatch sw_cpu;
-           CalcPseudoP_threaded();
-           long cpu_time = sw_cpu.Time();
-
-           // Restore GPU results
-           for (int i=0; i<num_obs; ++i) {
-               _sigLocal[i] = gpu_sigLocal[i];
-               _sigCat[i] = gpu_sigCat[i];
-           }
-
-           double speedup = (gpu_time > 0) ? ((double)cpu_time / (double)gpu_time) : 0.0;
-           int nCPUs = GdaConst::gda_set_cpu_cores ? GdaConst::gda_cpu_cores : wxThread::GetCPUCount();
-           wxString gpu_info = "Apple Silicon GPU";
-#ifdef __WXMAC__
-           int nGPUs = get_metal_gpu_core_count();
-           const char* dev_name = get_metal_device_name();
-           if (nGPUs > 0) {
-               gpu_info = wxString::Format("%s (%d GPU Cores)", dev_name, nGPUs);
-           } else {
-               gpu_info = wxString::Format("%s", dev_name);
-           }
-#endif
-           wxString msg = wxString::Format(
-               "⚡ Apple Metal GPU vs CPU Benchmark (Local Moran)\n\n"
-               "• Observations: %d\n"
-               "• Permutations: %d\n"
-               "• GPU: %s\n"
-               "• CPU: %d Cores Multi-Threaded\n\n"
-               "⏱️ Apple Metal GPU:  %ld ms\n"
-               "⏱️ CPU Multi-Core:   %ld ms\n\n"
-               "🚀 GPU Speedup:      %.2fx %s",
-               num_obs, permutations,
-               gpu_info, nCPUs,
-               gpu_time, cpu_time, speedup,
-               (speedup >= 1.0) ? "faster!" : ""
-           );
-           wxMessageBox(msg, "GeoDa Metal Performance", wxOK | wxICON_INFORMATION);
 		} else {
 			wxMessageDialog dlg(NULL, "GeoDa can't configure GPU device. Default CPU solution will be used instead.", _("Error"), wxOK | wxICON_ERROR);
 			dlg.ShowModal();

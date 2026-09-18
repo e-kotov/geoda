@@ -1,6 +1,4 @@
 #import <Foundation/Foundation.h>
-#define STANDALONE_TEST 1
-#include "metal_lisa.h"
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -10,8 +8,23 @@
 #include <iomanip>
 #include <algorithm>
 
-// Reproducible pseudo-random generator matching the Metal kernel logic
-inline float ThomasWangHashFloat(unsigned long long key)
+// wx-free stand-in for ShapeOperations/GalWeight.h
+class GalElement {
+    std::vector<long> nbr;
+public:
+    void SetSizeNbrs(size_t sz) { nbr.resize(sz); }
+    void SetNbr(size_t pos, long n) { nbr[pos] = n; }
+    long Size() const { return (long)nbr.size(); }
+    long operator[](size_t n) const { return nbr[n]; }
+    bool Check(long n) const { return std::find(nbr.begin(), nbr.end(), n) != nbr.end(); }
+};
+
+#define STANDALONE_TEST
+#include "metal_lisa.mm"
+#include "test_data_natregimes.h" // GeoDa sample data, see make_test_data.R
+
+// Gda::ThomasWangHashDouble()
+inline double ThomasWangHashDouble(unsigned long long key)
 {
     key = (~key) + (key << 21);
     key = key ^ (key >> 24);
@@ -20,7 +33,7 @@ inline float ThomasWangHashFloat(unsigned long long key)
     key = (key + (key << 2)) + (key << 4);
     key = key ^ (key >> 28);
     key = key + (key << 31);
-    return (float)(key & 0xFFFFFFFF) * 2.3283064365386963e-10f;
+    return 5.42101086242752217E-20 * key;
 }
 
 // Reference CPU implementation for a chunk of observations
@@ -38,7 +51,7 @@ void cpu_lisa_worker(int start_row, int end_row, int n, int permutations,
         }
 
         unsigned long long seed_start = i + last_seed;
-        float max_rand = (float)(n - 1);
+        double max_rand = (double)(n - 1);
         int countLarger = 0;
 
         if ((int)rnd_numbers.size() < numNeighbors * 2) {
@@ -47,11 +60,11 @@ void cpu_lisa_worker(int start_row, int end_row, int n, int permutations,
 
         for (int perm = 0; perm < permutations; perm++) {
             int rand_cnt = 0;
-            float permutedLag = 0.0f;
+            double permutedLag = 0.0;
 
             while (rand_cnt < numNeighbors) {
-                float rng_val = ThomasWangHashFloat(seed_start++) * max_rand;
-                int newRandom = (int)rng_val;
+                double rng_val = ThomasWangHashDouble(seed_start++) * max_rand;
+                int newRandom = (int)floor(rng_val + 0.5);
 
                 if (newRandom != i) {
                     bool is_valid = true;
@@ -62,15 +75,15 @@ void cpu_lisa_worker(int start_row, int end_row, int n, int permutations,
                         }
                     }
                     if (is_valid) {
-                        permutedLag += (float)values[newRandom];
+                        permutedLag += values[newRandom];
                         rnd_numbers[rand_cnt++] = newRandom;
                     }
                 }
             }
 
-            permutedLag /= (float)numNeighbors;
-            float localMoranPermuted = permutedLag * (float)values[i];
-            if (localMoranPermuted > (float)local_moran[i]) {
+            permutedLag /= numNeighbors;
+            double localMoranPermuted = permutedLag * values[i];
+            if (localMoranPermuted > local_moran[i]) {
                 countLarger++;
             }
         }
@@ -126,8 +139,17 @@ BenchmarkResult run_benchmark(int n, int k, int permutations, const char* metal_
     std::vector<double> p_metal(n, 0.0);
     std::vector<GalElement> w(n);
 
-    // Generate synthetic spatial grid / ring data
-    for (int i = 0; i < n; i++) {
+    // Real data (GeoDa's "US Homicides" sample, hr90, queen weights) if n matches
+    bool real_data = (n == natregimes_n);
+    for (int i = 0; real_data && i < n; i++) {
+        values[i] = natregimes_x[i];
+        int nn = natregimes_nbr_offset[i + 1] - natregimes_nbr_offset[i];
+        w[i].SetSizeNbrs(nn);
+        for (int j = 0; j < nn; j++) w[i].SetNbr(j, natregimes_nbrs[natregimes_nbr_offset[i] + j]);
+    }
+
+    // otherwise generate synthetic spatial grid / ring data
+    for (int i = 0; !real_data && i < n; i++) {
         values[i] = std::sin((double)i * 0.05) + std::cos((double)i * 0.02);
         w[i].SetSizeNbrs(k);
         for (int j = 0; j < k; j++) {
@@ -210,34 +232,48 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    std::vector<int> test_sizes = {1000, 5000, 25000};
-    int permutations = 999;
-    int k_neighbors = 8;
+    struct BenchmarkConfig {
+        std::string name;
+        int n;
+        int k;
+        int permutations;
+    };
+
+    std::vector<BenchmarkConfig> configs = {
+        {"US Homicides hr90 (real data)", natregimes_n, 6, 99999},
+        {"50k Grid", 50176, 8, 999},
+        {"All Denmark", 179674, 8, 999}
+    };
+
     std::vector<BenchmarkResult> results;
 
-    for (int n : test_sizes) {
-        std::cout << "Benchmarking N = " << n << " (permutations=" << permutations << ", k=" << k_neighbors << ")...\n";
-        BenchmarkResult r = run_benchmark(n, k_neighbors, permutations, kernel_path, num_threads);
+    for (const auto& cfg : configs) {
+        double total_m = (double)cfg.n * (double)cfg.permutations / 1e6;
+        std::cout << ">>> Running " << cfg.name << " (N = " << cfg.n << ", P = " << cfg.permutations
+                  << ", Total = " << std::fixed << std::setprecision(2) << total_m << "M perms, k = " << cfg.k << ")...\n";
+        BenchmarkResult r = run_benchmark(cfg.n, cfg.k, cfg.permutations, kernel_path, num_threads);
         results.push_back(r);
-        std::cout << "  -> CPU Multi-Core: " << std::fixed << std::setprecision(1) << r.cpu_multi_ms << " ms\n";
-        std::cout << "  -> Metal GPU:      " << std::fixed << std::setprecision(1) << r.metal_gpu_ms << " ms\n";
-        std::cout << "  -> Speedup:        " << std::fixed << std::setprecision(2) << r.speedup_vs_multi << "x (vs multi-core), "
-                  << r.speedup_vs_single << "x (vs 1-core)\n";
-        std::cout << "  -> Max p-diff:     " << r.max_pval_diff << "\n\n";
+        std::cout << "  -> CPU Multi-Core (" << num_threads << " threads): " << std::fixed << std::setprecision(3) << (r.cpu_multi_ms / 1000.0) << " s\n";
+        std::cout << "  -> Apple Metal GPU:               " << std::fixed << std::setprecision(3) << (r.metal_gpu_ms / 1000.0) << " s\n";
+        std::cout << "  -> GPU Speedup:                   " << std::fixed << std::setprecision(2) << r.speedup_vs_multi << "x faster\n";
+        std::cout << "  -> Max p-val diff:                " << std::setprecision(4) << r.max_pval_diff << "\n\n";
     }
 
     // Print summary table in Markdown format
     std::stringstream md;
     md << "### 🚀 GeoDa Permutation Performance: CPU vs Apple Metal GPU\n\n";
-    md << "| Dataset Size ($N$) | Permutations | CPU (" << num_threads << " Cores) | Apple Metal GPU | Speedup (vs Multi-Core) | Speedup (vs 1-Core) | Max p-value Diff |\n";
-    md << "|:---|:---|:---|:---|:---|:---|:---|\n";
+    md << "| Dataset | $N$ (Cells) | $P$ (Perms) | Total Permutations | CPU (" << num_threads << " Cores) | Apple Metal GPU | Speedup (vs Multi-Core) | Max p-value Diff |\n";
+    md << "|:---|:---|:---|:---|:---|:---|:---|:---|\n";
 
-    for (const auto& r : results) {
-        md << "| **" << r.n << "** | " << r.permutations << " | "
-           << std::fixed << std::setprecision(1) << r.cpu_multi_ms << " ms | "
-           << std::fixed << std::setprecision(1) << r.metal_gpu_ms << " ms | "
-           << "**" << std::fixed << std::setprecision(2) << r.speedup_vs_multi << "x** | "
-           << std::fixed << std::setprecision(2) << r.speedup_vs_single << "x | "
+    for (size_t i = 0; i < results.size(); ++i) {
+        const auto& r = results[i];
+        const auto& cfg = configs[i];
+        double total_m = (double)cfg.n * (double)cfg.permutations / 1e6;
+        md << "| **" << cfg.name << "** | " << r.n << " | " << r.permutations << " | "
+           << std::fixed << std::setprecision(2) << total_m << "M | "
+           << std::fixed << std::setprecision(3) << (r.cpu_multi_ms / 1000.0) << " s | **"
+           << std::fixed << std::setprecision(3) << (r.metal_gpu_ms / 1000.0) << " s** | **"
+           << std::fixed << std::setprecision(1) << r.speedup_vs_multi << "x** | "
            << std::setprecision(4) << r.max_pval_diff << " |\n";
     }
 
@@ -255,9 +291,11 @@ int main(int argc, char* argv[])
     // Write CSV
     std::ofstream csv("benchmark-results.csv");
     if (csv.is_open()) {
-        csv << "n,permutations,cpu_single_ms,cpu_multi_ms,metal_gpu_ms,speedup_vs_multi,speedup_vs_single,max_pval_diff\n";
-        for (const auto& r : results) {
-            csv << r.n << "," << r.permutations << "," << r.cpu_single_ms << ","
+        csv << "name,n,permutations,cpu_single_ms,cpu_multi_ms,metal_gpu_ms,speedup_vs_multi,speedup_vs_single,max_pval_diff\n";
+        for (size_t i = 0; i < results.size(); ++i) {
+            const auto& r = results[i];
+            const auto& cfg = configs[i];
+            csv << cfg.name << "," << r.n << "," << r.permutations << "," << r.cpu_single_ms << ","
                 << r.cpu_multi_ms << "," << r.metal_gpu_ms << ","
                 << r.speedup_vs_multi << "," << r.speedup_vs_single << ","
                 << r.max_pval_diff << "\n";

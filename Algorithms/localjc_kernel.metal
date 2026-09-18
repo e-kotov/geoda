@@ -1,74 +1,70 @@
 #include <metal_stdlib>
 using namespace metal;
 
-inline float wang_rnd(uint seed)
+// Same draw as the CPU code: round(Gda::ThomasWangHashDouble(key) * max_rand),
+// i.e. round(hash * max_rand / 2^64), in integer arithmetic (no fp64 on Apple GPUs)
+inline int ThomasWangHashIndex(ulong key, ulong max_rand)
 {
-    seed = (seed ^ 61) ^ (seed >> 16);
-    seed *= 9;
-    seed = seed ^ (seed >> 4);
-    seed *= 0x27d4eb2d;
-    seed = seed ^ (seed >> 15);
-    return (float)seed / 4294967295.0f;
+    key = (~key) + (key << 21);
+    key = key ^ (key >> 24);
+    key = (key + (key << 3)) + (key << 8);
+    key = key ^ (key >> 14);
+    key = (key + (key << 2)) + (key << 4);
+    key = key ^ (key >> 28);
+    key = key + (key << 31);
+    return (int)(mulhi(key, max_rand) + ((key * max_rand) >> 63));
 }
 
 kernel void localjc_metal(
     constant int &n                       [[buffer(0)]],
     constant int &permutations            [[buffer(1)]],
     constant ulong &last_seed             [[buffer(2)]],
-    constant ulong &num_vars              [[buffer(3)]],
-    device const ushort *zz               [[buffer(4)]],
-    device const ushort *local_jc         [[buffer(5)]],
-    device const ushort *num_nbrs         [[buffer(6)]],
-    device const ushort *nbr_idx          [[buffer(7)]],
-    device float *p                       [[buffer(8)]],
+    device const int *num_nbrs            [[buffer(3)]],
+    device const int *zz                  [[buffer(4)]],
+    device const int *local_jc            [[buffer(5)]],
+    device int *count_larger              [[buffer(6)]],
     uint i                                [[thread_position_in_grid]])
 {
     if (i >= (uint)n) {
         return;
     }
-    if (local_jc[i] == 0) {
-        p[i] = 0.0f;
+
+    int numNeighbors = num_nbrs[i];
+    if (local_jc[i] == 0 || numNeighbors == 0) {
+        count_larger[i] = -1; // no permutation test
         return;
     }
 
-    uint numNeighbors = (uint)num_nbrs[i];
-    if (numNeighbors == 0) {
-        p[i] = 0.0f;
-        return;
-    }
-
-    uint seed_start = (uint)(i + last_seed);
-    int rnd_numbers[123];
+    ulong seed_start = i + last_seed;
+    ulong max_rand = (ulong)(n - 1);
     int countLarger = 0;
-    float max_rand = (float)(n - 1);
+
+    int rnd_numbers[MAX_NBRS];
 
     for (int perm = 0; perm < permutations; perm++) {
         int rand = 0;
         int permutedLag = 0;
 
-        while (rand < (int)numNeighbors) {
-            float rng_val = wang_rnd(seed_start++) * max_rand;
-            int newRandom = (int)rng_val;
+        while (rand < numNeighbors) {
+            int newRandom = ThomasWangHashIndex(seed_start++, max_rand);
 
             if (newRandom != (int)i) {
                 bool is_valid = true;
                 for (int j = 0; j < rand; j++) {
-                    if (rnd_numbers[j] == newRandom) {
+                    if (newRandom == rnd_numbers[j]) {
                         is_valid = false;
                         break;
                     }
                 }
                 if (is_valid) {
-                    permutedLag += (int)zz[newRandom];
-                    if (rand < 123) {
-                        rnd_numbers[rand] = newRandom;
-                    }
+                    permutedLag += zz[newRandom];
+                    rnd_numbers[rand] = newRandom;
                     rand++;
                 }
             }
         }
 
-        if (permutedLag >= (int)local_jc[i]) {
+        if (permutedLag >= local_jc[i]) {
             countLarger++;
         }
     }
@@ -77,5 +73,6 @@ kernel void localjc_metal(
         countLarger = permutations - countLarger;
     }
 
-    p[i] = (float)(countLarger + 1) / (float)(permutations + 1);
+    // pseudo p-value is computed on the host in double precision
+    count_larger[i] = countLarger;
 }

@@ -16,7 +16,7 @@ LIBS	=	$(WXLIBS) \
             $(GEODA_HOME)/temp/CLAPACK-3.2.1/lapack.a \
             -L/usr/lib -liconv -lcurl -lz -lpthread \
 			-framework OpenCL \
-			-framework Metal -framework Foundation -framework IOKit \
+			-framework Metal -framework Foundation \
             -L/usr/local/opt/gdal/lib -lgdal \
             $(GEODA_HOME)/libraries/lib/libboost_date_time.a \
             $(GEODA_HOME)/libraries/lib/libboost_thread.a \
@@ -66,13 +66,13 @@ o/%.$(OBJ_EXT):	%.cpp
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c -o $@ $< 
 
 ../o/%.$(OBJ_EXT):	%.mm
-	clang++ $(CXXFLAGS) $(CPPFLAGS) -ObjC++ -c -o $@ $<
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -fobjc-arc -c -o $@ $<
 
 o/%.$(OBJ_EXT):	%.mm
-	clang++ $(CXXFLAGS) $(CPPFLAGS) -ObjC++ -c -o $@ $<
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -fobjc-arc -c -o $@ $<
 
 %.$(OBJ_EXT):	%.mm
-	clang++ $(CXXFLAGS) $(CPPFLAGS) -ObjC++ -c -o $@ $<
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -fobjc-arc -c -o $@ $<
 
 #
 # default rules for handling subdirectories

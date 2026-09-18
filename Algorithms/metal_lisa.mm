@@ -1,69 +1,136 @@
 #ifdef __APPLE__
 
+// NOTE: compile with -fobjc-arc
+
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
-#import <IOKit/IOKitLib.h>
 #include "metal_lisa.h"
-#include <string>
-#include <fstream>
-#include <sstream>
+#ifndef STANDALONE_TEST // test_metal_lisa.mm provides a wx-free GalElement
+#include "../ShapeOperations/GalWeight.h"
+#endif
+#include <cmath>
 #include <iostream>
-#include <vector>
-#include <unordered_map>
+#include <map>
 #include <mutex>
+#include <string>
+#include <vector>
 
-static id<MTLDevice> s_device = nil;
-static id<MTLCommandQueue> s_commandQueue = nil;
-static std::unordered_map<int, id<MTLComputePipelineState>> s_lisa_pipeline_cache;
-static std::unordered_map<int, id<MTLComputePipelineState>> s_jc_pipeline_cache;
 static std::mutex s_metal_mutex;
+
+static id<MTLDevice> metal_device()
+{
+    static id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    return device;
+}
 
 bool is_metal_supported()
 {
-    @autoreleasepool {
-        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-        return (device != nil);
-    }
+    return metal_device() != nil;
 }
 
-int get_metal_gpu_core_count()
+// Compile (once per kernel and max_nbrs) the kernel from the .metal source
+static id<MTLComputePipelineState> metal_pipeline(const char* metal_path, NSString* kernel_name, int max_nbrs)
 {
-    static int cached_cores = 0;
-    if (cached_cores > 0) return cached_cores;
-    int cores = 0;
+    static std::map<std::pair<std::string, int>, id<MTLComputePipelineState> > cache;
+    std::pair<std::string, int> key([kernel_name UTF8String], max_nbrs);
+    if (cache.find(key) != cache.end()) return cache[key];
+
+    NSError* error = nil;
+    NSString* src = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:metal_path]
+                                              encoding:NSUTF8StringEncoding error:&error];
+    if (!src) {
+        std::cerr << "Metal: Could not read kernel from " << metal_path << "\n";
+        return nil;
+    }
+    MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+    options.preprocessorMacros = @{ @"MAX_NBRS" : @(max_nbrs) };
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AGXAccelerator"));
-    if (!service) {
-        service = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("AGXAccelerator"));
-    }
+    options.fastMathEnabled = NO; // the kernels rely on IEEE arithmetic
 #pragma clang diagnostic pop
-    if (service) {
-        CFNumberRef prop = (CFNumberRef)IORegistryEntryCreateCFProperty(service, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0);
-        if (prop) {
-            CFNumberGetValue(prop, kCFNumberIntType, &cores);
-            CFRelease(prop);
-        }
-        IOObjectRelease(service);
+    id<MTLLibrary> library = [metal_device() newLibraryWithSource:src options:options error:&error];
+    id<MTLFunction> func = library ? [library newFunctionWithName:kernel_name] : nil;
+    id<MTLComputePipelineState> pipeline = func ? [metal_device() newComputePipelineStateWithFunction:func error:&error] : nil;
+    if (!pipeline) {
+        std::cerr << "Metal: Could not build kernel " << [kernel_name UTF8String];
+        if (error) std::cerr << ": " << [[error localizedDescription] UTF8String];
+        std::cerr << "\n";
+        return nil;
     }
-    cached_cores = cores;
-    return cores;
+    cache[key] = pipeline;
+    return pipeline;
 }
 
-const char* get_metal_device_name()
+// Number of neighbors (excluding self) to permute for each observation
+static bool metal_num_nbrs(int rows, GalElement* w, bool skip_isolates, std::vector<int>& num_nbrs, int& max_nbrs)
 {
-    static std::string dev_name;
-    if (dev_name.empty()) {
-        @autoreleasepool {
-            id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-            if (device) {
-                dev_name = [device.name UTF8String];
-            } else {
-                dev_name = "Apple Silicon GPU";
-            }
-        }
+    int candidates = 0;
+    max_nbrs = 0;
+    num_nbrs.resize(rows);
+    for (int i = 0; i < rows; i++) {
+        num_nbrs[i] = (int)w[i].Size();
+        if (num_nbrs[i] > 0 || !skip_isolates) candidates++;
+        if (w[i].Check(i)) num_nbrs[i] -= 1;
+        if (num_nbrs[i] > max_nbrs) max_nbrs = num_nbrs[i];
     }
-    return dev_name.c_str();
+    // not enough observations to draw from: the permutation would never end
+    return max_nbrs < candidates;
+}
+
+// Run the kernel for each observation. Kernel arguments are n, permutations, seed,
+// num_nbrs, inputs... and the output count_larger (< 0 means no permutation test)
+typedef std::pair<const void*, size_t> MetalInput; // data, size in bytes
+
+static bool metal_run(const char* metal_path, NSString* kernel_name, int max_nbrs, int rows, int permutations,
+                      unsigned long long last_seed_used, const std::vector<int>& num_nbrs,
+                      std::vector<MetalInput> inputs, std::vector<int>& count_larger)
+{
+    @autoreleasepool {
+        std::lock_guard<std::mutex> lock(s_metal_mutex);
+        id<MTLDevice> device = metal_device();
+        if (!device) return false;
+        static id<MTLCommandQueue> queue = [device newCommandQueue];
+
+        // round up the size of kernel's work array to limit recompilations
+        int buf_size = 64;
+        while (buf_size < max_nbrs) buf_size *= 2;
+        id<MTLComputePipelineState> pipeline = metal_pipeline(metal_path, kernel_name, buf_size);
+        if (!queue || !pipeline) return false;
+
+        id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBytes:&rows length:sizeof(int) atIndex:0];
+        [encoder setBytes:&permutations length:sizeof(int) atIndex:1];
+        [encoder setBytes:&last_seed_used length:sizeof(unsigned long long) atIndex:2];
+
+        // unified memory shared buffers
+        inputs.insert(inputs.begin(), MetalInput(num_nbrs.data(), sizeof(int)*rows));
+        NSUInteger index = 3;
+        for (size_t i = 0; i < inputs.size(); i++) {
+            id<MTLBuffer> buf = [device newBufferWithBytes:inputs[i].first length:inputs[i].second options:MTLResourceStorageModeShared];
+            if (!buf) return false;
+            [encoder setBuffer:buf offset:0 atIndex:index++];
+        }
+        id<MTLBuffer> bufCount = [device newBufferWithLength:sizeof(int)*rows options:MTLResourceStorageModeShared];
+        if (!bufCount) return false;
+        [encoder setBuffer:bufCount offset:0 atIndex:index];
+
+        NSUInteger group_size = pipeline.maxTotalThreadsPerThreadgroup;
+        if (group_size > (NSUInteger)rows) group_size = rows;
+        [encoder dispatchThreads:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(group_size, 1, 1)];
+        [encoder endEncoding];
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+
+        if (cmdBuf.status != MTLCommandBufferStatusCompleted) {
+            std::cerr << "Metal: Command buffer execution failed.\n";
+            return false;
+        }
+        const int* result = (const int*)[bufCount contents];
+        count_larger.assign(result, result + rows);
+        return true;
+    }
 }
 
 bool metal_lisa(const char* metal_path, int rows, int permutations, unsigned long long last_seed_used,
@@ -71,147 +138,41 @@ bool metal_lisa(const char* metal_path, int rows, int permutations, unsigned lon
 {
     if (rows <= 0) return false;
 
-    @autoreleasepool {
-        std::lock_guard<std::mutex> lock(s_metal_mutex);
-        if (!s_device) {
-            s_device = MTLCreateSystemDefaultDevice();
+    int max_nbrs = 0;
+    std::vector<int> num_nbrs, count_larger;
+    if (!metal_num_nbrs(rows, w, true, num_nbrs, max_nbrs)) return false;
+
+    // No fp64 on Apple GPUs: pass each double as a (high, low) pair of floats.
+    // permuted lag * values[i] > local_moran[i] is tested in the kernel as
+    // sum of permuted neighbors >(<) lag_sum[i] for positive (negative) values[i]
+    std::vector<float> val(rows), val_lo(rows), lag_sum(rows, 0), lag_sum_lo(rows, 0);
+    double max_abs = 1;
+    for (int i = 0; i < rows; i++) {
+        val[i] = (float)values[i];
+        val_lo[i] = (float)(values[i] - val[i]);
+        if (fabs(values[i]) > max_abs) max_abs = fabs(values[i]);
+        if (val[i] != 0) {
+            double s = local_moran[i] * num_nbrs[i] / values[i];
+            lag_sum[i] = (float)s;
+            lag_sum_lo[i] = (float)(s - lag_sum[i]);
         }
-        id<MTLDevice> device = s_device;
-        if (!device) {
-            std::cerr << "Metal: No default device found.\n";
-            return false;
-        }
-
-        if (!s_commandQueue) {
-            s_commandQueue = [device newCommandQueue];
-        }
-        id<MTLCommandQueue> commandQueue = s_commandQueue;
-        if (!commandQueue) return false;
-
-        int max_n_nbrs = 0;
-        std::vector<int> num_nbrs(rows, 0);
-        int total_nbrs = 0;
-
-        for (int i = 0; i < rows; i++) {
-            long nnbrs = w[i].Size();
-            if (nnbrs > max_n_nbrs) {
-                max_n_nbrs = (int)nnbrs;
-            }
-            num_nbrs[i] = (int)nnbrs;
-            total_nbrs += (int)nnbrs;
-        }
-
-        std::vector<int> nbr_idx(total_nbrs > 0 ? total_nbrs : 1, 0);
-        size_t idx = 0;
-        for (int i = 0; i < rows; i++) {
-            long nnbrs = w[i].Size();
-            for (long j = 0; j < nnbrs; j++) {
-                if (idx < (size_t)total_nbrs) {
-                    nbr_idx[idx++] = w[i][j];
-                }
-            }
-        }
-
-        int buf_size = (max_n_nbrs * 2 < 64) ? 64 : (max_n_nbrs * 2);
-        id<MTLComputePipelineState> pipelineState = nil;
-        auto it = s_lisa_pipeline_cache.find(buf_size);
-        if (it != s_lisa_pipeline_cache.end()) {
-            pipelineState = it->second;
-        } else {
-            // Read shader source
-            std::ifstream t(metal_path);
-            std::stringstream buffer;
-            buffer << t.rdbuf();
-            std::string src_code = buffer.str();
-            if (src_code.empty()) {
-                std::cerr << "Metal: Could not read kernel from " << metal_path << "\n";
-                return false;
-            }
-
-            // Replace buffer size marker '123' with max_n_nbrs * 2 (at least 64)
-            std::string target = "123";
-            std::string replacement = std::to_string(buf_size);
-            size_t pos = 0;
-            while ((pos = src_code.find(target, pos)) != std::string::npos) {
-                src_code.replace(pos, target.length(), replacement);
-                pos += replacement.length();
-            }
-
-            NSError *error = nil;
-            NSString *sourceStr = [NSString stringWithUTF8String:src_code.c_str()];
-            MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
-            id<MTLLibrary> library = [device newLibraryWithSource:sourceStr options:options error:&error];
-            if (!library) {
-                std::cerr << "Metal compile error: " << [[error localizedDescription] UTF8String] << "\n";
-                return false;
-            }
-
-            id<MTLFunction> kernelFunc = [library newFunctionWithName:@"lisa_metal"];
-            if (!kernelFunc) {
-                std::cerr << "Metal: Kernel function 'lisa_metal' not found.\n";
-                return false;
-            }
-
-            pipelineState = [device newComputePipelineStateWithFunction:kernelFunc error:&error];
-            if (!pipelineState) {
-                std::cerr << "Metal pipeline state error: " << [[error localizedDescription] UTF8String] << "\n";
-                return false;
-            }
-            s_lisa_pipeline_cache[buf_size] = pipelineState;
-        }
-
-        // Convert double arrays to float for Apple Silicon GPU
-        std::vector<float> values_f(rows);
-        std::vector<float> local_moran_f(rows);
-        for (int i = 0; i < rows; i++) {
-            values_f[i] = (float)values[i];
-            local_moran_f[i] = (float)local_moran[i];
-        }
-
-        // Unified memory shared buffers
-        id<MTLBuffer> bufValues = [device newBufferWithBytes:values_f.data() length:sizeof(float)*rows options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bufMoran = [device newBufferWithBytes:local_moran_f.data() length:sizeof(float)*rows options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bufNumNbrs = [device newBufferWithBytes:num_nbrs.data() length:sizeof(int)*rows options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bufNbrIdx = [device newBufferWithBytes:nbr_idx.data() length:sizeof(int)*nbr_idx.size() options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bufP = [device newBufferWithLength:sizeof(float)*rows options:MTLResourceStorageModeShared];
-
-        id<MTLCommandBuffer> cmdBuf = [commandQueue commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
-
-        [encoder setComputePipelineState:pipelineState];
-        [encoder setBytes:&rows length:sizeof(int) atIndex:0];
-        [encoder setBytes:&permutations length:sizeof(int) atIndex:1];
-        [encoder setBytes:&last_seed_used length:sizeof(unsigned long long) atIndex:2];
-        [encoder setBuffer:bufValues offset:0 atIndex:3];
-        [encoder setBuffer:bufMoran offset:0 atIndex:4];
-        [encoder setBuffer:bufNumNbrs offset:0 atIndex:5];
-        [encoder setBuffer:bufNbrIdx offset:0 atIndex:6];
-        [encoder setBuffer:bufP offset:0 atIndex:7];
-
-        MTLSize gridSize = MTLSizeMake(rows, 1, 1);
-        NSUInteger maxThreads = pipelineState.maxTotalThreadsPerThreadgroup;
-        NSUInteger threadGroupSize = (maxThreads > (NSUInteger)rows) ? (NSUInteger)rows : maxThreads;
-        if (threadGroupSize == 0) threadGroupSize = 1;
-        MTLSize threadgroupSize = MTLSizeMake(threadGroupSize, 1, 1);
-
-        [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
-        [encoder endEncoding];
-
-        [cmdBuf commit];
-        [cmdBuf waitUntilCompleted];
-
-        if (cmdBuf.status != MTLCommandBufferStatusCompleted) {
-            std::cerr << "Metal: Command buffer execution failed.\n";
-            return false;
-        }
-
-        float *p_res = (float *)[bufP contents];
-        for (int i = 0; i < rows; i++) {
-            p[i] = (double)p_res[i];
-        }
-
-        return true;
     }
+    // differences from the observed value below this are roundoff errors, i.e. ties
+    float tie_tol = (float)(1e-11 * max_abs * (max_nbrs + 1));
+
+    std::vector<MetalInput> inputs;
+    inputs.push_back(MetalInput(val.data(), sizeof(float)*rows));
+    inputs.push_back(MetalInput(val_lo.data(), sizeof(float)*rows));
+    inputs.push_back(MetalInput(lag_sum.data(), sizeof(float)*rows));
+    inputs.push_back(MetalInput(lag_sum_lo.data(), sizeof(float)*rows));
+    inputs.push_back(MetalInput(&tie_tol, sizeof(float)));
+    if (!metal_run(metal_path, @"lisa_metal", max_nbrs, rows, permutations, last_seed_used,
+                   num_nbrs, inputs, count_larger)) return false;
+
+    for (int i = 0; i < rows; i++) {
+        if (count_larger[i] >= 0) p[i] = (count_larger[i] + 1.0) / (permutations + 1);
+    }
+    return true;
 }
 
 bool metal_localjoincount(const char* metal_path, int rows, int permutations, unsigned long long last_seed_used,
@@ -219,147 +180,23 @@ bool metal_localjoincount(const char* metal_path, int rows, int permutations, un
 {
     if (rows <= 0) return false;
 
-    @autoreleasepool {
-        std::lock_guard<std::mutex> lock(s_metal_mutex);
-        if (!s_device) {
-            s_device = MTLCreateSystemDefaultDevice();
-        }
-        id<MTLDevice> device = s_device;
-        if (!device) {
-            std::cerr << "Metal: No default device found.\n";
-            return false;
-        }
+    int max_nbrs = 0;
+    std::vector<int> num_nbrs, count_larger;
+    if (!metal_num_nbrs(rows, w, false, num_nbrs, max_nbrs)) return false;
 
-        if (!s_commandQueue) {
-            s_commandQueue = [device newCommandQueue];
-        }
-        id<MTLCommandQueue> commandQueue = s_commandQueue;
-        if (!commandQueue) return false;
+    std::vector<int> local_jc_i(local_jc, local_jc + rows);
 
-        int max_n_nbrs = 0;
-        std::vector<unsigned short> num_nbrs(rows, 0);
-        int total_nbrs = 0;
+    std::vector<MetalInput> inputs;
+    inputs.push_back(MetalInput(zz, sizeof(int)*rows));
+    inputs.push_back(MetalInput(local_jc_i.data(), sizeof(int)*rows));
+    if (!metal_run(metal_path, @"localjc_metal", max_nbrs, rows, permutations, last_seed_used,
+                   num_nbrs, inputs, count_larger)) return false;
 
-        for (int i = 0; i < rows; i++) {
-            long nnbrs = w[i].Size();
-            if (nnbrs > max_n_nbrs) {
-                max_n_nbrs = (int)nnbrs;
-            }
-            num_nbrs[i] = (unsigned short)nnbrs;
-            total_nbrs += (int)nnbrs;
-        }
-
-        std::vector<unsigned short> nbr_idx(total_nbrs > 0 ? total_nbrs : 1, 0);
-        size_t idx = 0;
-        for (int i = 0; i < rows; i++) {
-            long nnbrs = w[i].Size();
-            for (long j = 0; j < nnbrs; j++) {
-                if (idx < (size_t)total_nbrs) {
-                    nbr_idx[idx++] = (unsigned short)w[i][j];
-                }
-            }
-        }
-
-        std::vector<unsigned short> zz_us(rows);
-        std::vector<unsigned short> local_jc_us(rows);
-        for (int i = 0; i < rows; i++) {
-            zz_us[i] = (unsigned short)zz[i];
-            local_jc_us[i] = (unsigned short)local_jc[i];
-        }
-
-        int buf_size = (max_n_nbrs * 2 < 64) ? 64 : (max_n_nbrs * 2);
-        id<MTLComputePipelineState> pipelineState = nil;
-        auto it = s_jc_pipeline_cache.find(buf_size);
-        if (it != s_jc_pipeline_cache.end()) {
-            pipelineState = it->second;
-        } else {
-            // Read shader source
-            std::ifstream t(metal_path);
-            std::stringstream buffer;
-            buffer << t.rdbuf();
-            std::string src_code = buffer.str();
-            if (src_code.empty()) {
-                std::cerr << "Metal: Could not read kernel from " << metal_path << "\n";
-                return false;
-            }
-
-            std::string target = "123";
-            std::string replacement = std::to_string(buf_size);
-            size_t pos = 0;
-            while ((pos = src_code.find(target, pos)) != std::string::npos) {
-                src_code.replace(pos, target.length(), replacement);
-                pos += replacement.length();
-            }
-
-            NSError *error = nil;
-            NSString *sourceStr = [NSString stringWithUTF8String:src_code.c_str()];
-            MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
-            id<MTLLibrary> library = [device newLibraryWithSource:sourceStr options:options error:&error];
-            if (!library) {
-                std::cerr << "Metal compile error: " << [[error localizedDescription] UTF8String] << "\n";
-                return false;
-            }
-
-            id<MTLFunction> kernelFunc = [library newFunctionWithName:@"localjc_metal"];
-            if (!kernelFunc) {
-                std::cerr << "Metal: Kernel function 'localjc_metal' not found.\n";
-                return false;
-            }
-
-            pipelineState = [device newComputePipelineStateWithFunction:kernelFunc error:&error];
-            if (!pipelineState) {
-                std::cerr << "Metal pipeline state error: " << [[error localizedDescription] UTF8String] << "\n";
-                return false;
-            }
-            s_jc_pipeline_cache[buf_size] = pipelineState;
-        }
-
-        unsigned long u_num_vars = (unsigned long)num_vars;
-
-        id<MTLBuffer> bufZZ = [device newBufferWithBytes:zz_us.data() length:sizeof(unsigned short)*rows options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bufJC = [device newBufferWithBytes:local_jc_us.data() length:sizeof(unsigned short)*rows options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bufNumNbrs = [device newBufferWithBytes:num_nbrs.data() length:sizeof(unsigned short)*rows options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bufNbrIdx = [device newBufferWithBytes:nbr_idx.data() length:sizeof(unsigned short)*nbr_idx.size() options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bufP = [device newBufferWithLength:sizeof(float)*rows options:MTLResourceStorageModeShared];
-
-        id<MTLCommandBuffer> cmdBuf = [commandQueue commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
-
-        [encoder setComputePipelineState:pipelineState];
-        [encoder setBytes:&rows length:sizeof(int) atIndex:0];
-        [encoder setBytes:&permutations length:sizeof(int) atIndex:1];
-        [encoder setBytes:&last_seed_used length:sizeof(unsigned long long) atIndex:2];
-        [encoder setBytes:&u_num_vars length:sizeof(unsigned long) atIndex:3];
-        [encoder setBuffer:bufZZ offset:0 atIndex:4];
-        [encoder setBuffer:bufJC offset:0 atIndex:5];
-        [encoder setBuffer:bufNumNbrs offset:0 atIndex:6];
-        [encoder setBuffer:bufNbrIdx offset:0 atIndex:7];
-        [encoder setBuffer:bufP offset:0 atIndex:8];
-
-        MTLSize gridSize = MTLSizeMake(rows, 1, 1);
-        NSUInteger maxThreads = pipelineState.maxTotalThreadsPerThreadgroup;
-        NSUInteger threadGroupSize = (maxThreads > (NSUInteger)rows) ? (NSUInteger)rows : maxThreads;
-        if (threadGroupSize == 0) threadGroupSize = 1;
-        MTLSize threadgroupSize = MTLSizeMake(threadGroupSize, 1, 1);
-
-        [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
-        [encoder endEncoding];
-
-        [cmdBuf commit];
-        [cmdBuf waitUntilCompleted];
-
-        if (cmdBuf.status != MTLCommandBufferStatusCompleted) {
-            std::cerr << "Metal: Command buffer execution failed.\n";
-            return false;
-        }
-
-        float *p_res = (float *)[bufP contents];
-        for (int i = 0; i < rows; i++) {
-            p[i] = (double)p_res[i];
-        }
-
-        return true;
+    for (int i = 0; i < rows; i++) {
+        if (local_jc[i] == 0) p[i] = 0;
+        else if (count_larger[i] >= 0) p[i] = (count_larger[i] + 1.0) / (permutations + 1.0);
     }
+    return true;
 }
 
 #endif // __APPLE__

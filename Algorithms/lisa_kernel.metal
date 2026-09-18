@@ -1,7 +1,9 @@
 #include <metal_stdlib>
 using namespace metal;
 
-inline float ThomasWangHashFloat(ulong key)
+// Same draw as the CPU code: round(Gda::ThomasWangHashDouble(key) * max_rand),
+// i.e. round(hash * max_rand / 2^64), in integer arithmetic (no fp64 on Apple GPUs)
+inline int ThomasWangHashIndex(ulong key, ulong max_rand)
 {
     key = (~key) + (key << 21);
     key = key ^ (key >> 24);
@@ -10,18 +12,25 @@ inline float ThomasWangHashFloat(ulong key)
     key = (key + (key << 2)) + (key << 4);
     key = key ^ (key >> 28);
     key = key + (key << 31);
-    return (float)(key & 0xFFFFFFFF) * 2.3283064365386963e-10f;
+    return (int)(mulhi(key, max_rand) + ((key * max_rand) >> 63));
 }
 
+// There is no fp64 on Apple GPUs: a double x is passed as the pair of floats
+// (x, x_lo) with x + x_lo == x up to 48 bits, and the permuted lag is accumulated
+// as such pair (requires compiling without fast math).
+// local_moran_permuted > local_moran is tested as sum of permuted neighbors vs
+// lag_sum = the observed sum of neighbors; differences below tie_tol are ties.
 kernel void lisa_metal(
     constant int &n                       [[buffer(0)]],
     constant int &permutations            [[buffer(1)]],
     constant ulong &last_seed             [[buffer(2)]],
-    device const float *values            [[buffer(3)]],
-    device const float *local_moran       [[buffer(4)]],
-    device const int *num_nbrs            [[buffer(5)]],
-    device const int *nbr_idx             [[buffer(6)]],
-    device float *p                       [[buffer(7)]],
+    device const int *num_nbrs            [[buffer(3)]],
+    device const float *values            [[buffer(4)]],
+    device const float *values_lo         [[buffer(5)]],
+    device const float *lag_sum           [[buffer(6)]],
+    device const float *lag_sum_lo        [[buffer(7)]],
+    constant float &tie_tol               [[buffer(8)]],
+    device int *count_larger              [[buffer(9)]],
     uint i                                [[thread_position_in_grid]])
 {
     if (i >= (uint)n) {
@@ -30,25 +39,24 @@ kernel void lisa_metal(
 
     int numNeighbors = num_nbrs[i];
     if (numNeighbors == 0) {
-        p[i] = 1.0f;
+        count_larger[i] = -1; // no permutation test
         return;
     }
 
     ulong seed_start = i + last_seed;
-    float max_rand = (float)(n - 1);
+    ulong max_rand = (ulong)(n - 1);
     int countLarger = 0;
 
-    int rnd_numbers[123];
+    int rnd_numbers[MAX_NBRS];
 
     for (int perm = 0; perm < permutations; perm++) {
         int rand = 0;
-        float permutedLag = 0.0f;
+        float permutedLag = 0.0f, permutedLag_lo = 0.0f;
 
         while (rand < numNeighbors) {
-            float rng_val = ThomasWangHashFloat(seed_start++) * max_rand;
-            int newRandom = (int)rng_val;
+            int newRandom = ThomasWangHashIndex(seed_start++, max_rand);
 
-            if (newRandom != (int)i) {
+            if (newRandom != (int)i && num_nbrs[newRandom] > 0) {
                 bool is_valid = true;
                 for (int j = 0; j < rand; j++) {
                     if (newRandom == rnd_numbers[j]) {
@@ -57,18 +65,20 @@ kernel void lisa_metal(
                     }
                 }
                 if (is_valid) {
-                    permutedLag += values[newRandom];
-                    if (rand < 123) {
-                        rnd_numbers[rand] = newRandom;
-                    }
+                    // Knuth's TwoSum: s + err == permutedLag + values[newRandom] exactly
+                    float s = permutedLag + values[newRandom];
+                    float t = s - permutedLag;
+                    float err = (permutedLag - (s - t)) + (values[newRandom] - t);
+                    permutedLag = s;
+                    permutedLag_lo += err + values_lo[newRandom];
+                    rnd_numbers[rand] = newRandom;
                     rand++;
                 }
             }
         }
 
-        permutedLag /= (float)numNeighbors;
-        float localMoranPermuted = permutedLag * values[i];
-        if (localMoranPermuted > local_moran[i]) {
+        float diff = (permutedLag - lag_sum[i]) + (permutedLag_lo - lag_sum_lo[i]);
+        if ((values[i] > 0 && diff > tie_tol) || (values[i] < 0 && diff < -tie_tol)) {
             countLarger++;
         }
     }
@@ -77,5 +87,6 @@ kernel void lisa_metal(
         countLarger = permutations - countLarger;
     }
 
-    p[i] = (float)(countLarger + 1) / (float)(permutations + 1);
+    // pseudo p-value is computed on the host in double precision
+    count_larger[i] = countLarger;
 }
