@@ -6,15 +6,17 @@
 //
 // The reference below is the conditional permutation of
 // AbstractCoordinator::CalcPseudoP_range() / JCCoordinator::CalcPseudoP_range().
-// 1. With the random sequence of observation i starting at seed + i (what the GPU
-//    does), GPU and CPU draw the same permutations, so pseudo p-values must be equal --
+// 1. With the keys of the GPU kernels (permutation q of observation i draws from its own
+//    sequence of keys, see permutation_key()), GPU and CPU draw the same permutations, so
+//    pseudo p-values must be equal --
 //    except for permutations so close to the observed value that the CPU's own double
 //    arithmetic decides its >= by roundoff.  Those the GPU always counts as larger, so
 //    its count must lie between the CPU's count with none and with all of them counted
 //    ("the BOUNDS rule", see the derivation further down).  Local Join Count sums small
 //    integers and is therefore bit-identical.
-// 2. With one sequential random sequence (what single threaded GeoDa does), pseudo
-//    p-values must agree within Monte Carlo error.
+// 2. With one sequential random sequence (what single threaded GeoDa does), the pseudo
+//    p-values of the same CPU arithmetic must agree within Monte Carlo error (see
+//    monte_carlo_limit()): the keys of the GPU are as good as GeoDa's.
 // 3. No pseudo p-value may be written where the CPU runs no permutation test.
 #include <algorithm>
 #include <cmath>
@@ -40,8 +42,8 @@ public:
 #include "test_data_guerry.h"
 #include "test_data_natregimes.h"
 
-// Gda::ThomasWangHashDouble()
-static double ThomasWangHashDouble(uint64_t key)
+// The 64 bit integer hash of Gda::ThomasWangHashDouble(), before it is scaled to a double
+static uint64_t ThomasWangHash(uint64_t key)
 {
     key = (~key) + (key << 21);
     key = key ^ (key >> 24);
@@ -50,7 +52,34 @@ static double ThomasWangHashDouble(uint64_t key)
     key = (key + (key << 2)) + (key << 4);
     key = key ^ (key >> 28);
     key = key + (key << 31);
-    return 5.42101086242752217E-20 * key;
+    return key;
+}
+
+// Gda::ThomasWangHashDouble()
+static double ThomasWangHashDouble(uint64_t key)
+{
+    return 5.42101086242752217E-20 * ThomasWangHash(key);
+}
+
+// The keys of the GPU kernels (GPU-7 in dev-notes/UPSTREAM_BUGS.md): permutation q of
+// observation i draws from its own sequence of keys, which starts here (64 bit unsigned
+// arithmetic, wraparound intended)
+static uint64_t permutation_key(uint64_t seed, int i, int q)
+{
+    return ThomasWangHash(ThomasWangHash(seed + (uint64_t)i) + (uint64_t)q);
+}
+
+// What the references below draw for one permutation of one observation, rejected
+// indices included: test_permutation_keys() compares it with the rule
+struct DrawTrace {
+    int obs, perm;
+    std::vector<int> drawn;
+};
+static DrawTrace* draw_trace = 0;
+
+static void trace_draw(int i, int perm, int r)
+{
+    if (draw_trace && draw_trace->obs == i && draw_trace->perm == perm) draw_trace->drawn.push_back(r);
 }
 
 // Knuth's TwoSum: a + b == s + err exactly.  The tie test classifies by the EXACT
@@ -192,7 +221,6 @@ static void cpu_reference(bool is_jc, bool per_obs_seed, int n, int permutations
     std::vector<int> perm_nbrs;
 
     for (int i = 0; i < n; i++) {
-        if (per_obs_seed) seed_start = seed + i;
         if (undef && (*undef)[i]) continue;          // JCCoordinator::CalcPseudoP_range():623
         if (is_jc && local_sa[i] == 0) { p[i] = 0; continue; }
         int num_nbrs = (int)w[i].Size();
@@ -201,10 +229,12 @@ static void cpu_reference(bool is_jc, bool per_obs_seed, int n, int permutations
 
         int count_larger = 0, count_lo = 0, count_hi = 0;
         for (int perm = 0; perm < permutations; perm++) {
+            if (per_obs_seed) seed_start = permutation_key(seed, i, perm);
             perm_nbrs.clear();
             while ((int)perm_nbrs.size() < num_nbrs) {
                 double rng_val = ThomasWangHashDouble(seed_start++) * max_rand;
                 int r = (int)(rng_val < 0.0 ? ceil(rng_val - 0.5) : floor(rng_val + 0.5));
+                if (per_obs_seed) trace_draw(i, perm, r);
                 // Join Count rejects undefined observations, Local Moran neighborless ones
                 if (r != i && !drawn[r] &&
                     (is_jc ? (!undef || !(*undef)[r]) : w[r].Size() > 0)) {
@@ -375,6 +405,23 @@ static TestCase exact_ties(int n)
     return tc;
 }
 
+// Largest difference allowed between two INDEPENDENT pseudo p-values of one observation,
+// both from `permutations` permutations and the same arithmetic.  The counts c1, c2 are
+// binomial with the same unknown probability pi; folding into the smaller tail is
+// 1-Lipschitz, so |p1 - p2| <= |c1 - c2| / (permutations + 1).  c1 - c2 is a sum of
+// `permutations` independent terms in {-1, 0, 1} with mean 0 and variance
+// 2 pi (1 - pi) <= 1/2, so Bernstein's inequality gives, for every pi,
+//   P(|c1 - c2| >= t) <= 2 exp(-t^2 / (permutations + 2t/3)).
+// With t = L/3 + sqrt(L^2/9 + L permutations), L = log(2 M / alpha), the right hand side is
+// alpha / M: over M comparisons a correct implementation fails with probability < alpha.
+// alpha = 1e-6 per run of this test, M = 1e5 (the test makes about 16,000 comparisons).
+// That is 0.170 for 999 permutations (7.6 standard errors of the worst case pi = 1/2).
+static double monte_carlo_limit(int permutations)
+{
+    const double L = log(2 * 1e5 / 1e-6);
+    return (L / 3 + sqrt(L * L / 9 + L * permutations)) / (permutations + 1);
+}
+
 static int failures = 0;
 
 static bool check(bool ok, const char* what)
@@ -418,12 +465,19 @@ static std::vector<std::vector<double> > one_period(const std::vector<double>& v
     return std::vector<std::vector<double> >(1, v);
 }
 
-static void run(TestCase& tc, const char* lisa_path, const char* jc_path, int permutations)
+static const uint64_t kDefaultSeed = 123456789;   // GeoDa's default seed
+// Seeds above 32 bits: a key computed with a 32 bit intermediate passes every test that
+// only uses the default seed.  Both halves of the first one matter; with the second one
+// seed + i wraps around 2^64 inside every data set (at observation 41).
+static const uint64_t kSeed64 = 0xFEDCBA9876543210ULL;
+static const uint64_t kSeedWrap = 18446744073709551575ULL;   // 2^64 - 41
+
+static void run(TestCase& tc, const char* lisa_path, const char* jc_path, int permutations,
+                uint64_t seed = kDefaultSeed)
 {
-    const uint64_t seed = 123456789; // GeoDa's default seed
     const double untouched = -1;
     int n = (int)tc.x.size();
-    printf("%s (n=%d, permutations=%d)\n", tc.name, n, permutations);
+    printf("%s (n=%d, permutations=%d, seed=%llu)\n", tc.name, n, permutations, (unsigned long long)seed);
 
     // JCCoordinator marks isolates undefined (MLJCCoordinator.cpp:252-263): its draw
     // rejects them and they get no pseudo p-value
@@ -451,7 +505,7 @@ static void run(TestCase& tc, const char* lisa_path, const char* jc_path, int pe
         check(ok, is_jc ? "metal_localjoincount() runs" : "metal_lisa() runs");
         if (!ok) continue;
         cpu_reference(is_jc, true, n, permutations, seed, x, local_sa, tc.w, p_cpu, &bounds, jc_undef);
-        cpu_reference(is_jc, false, n, permutations, seed, x, local_sa, tc.w, p_seq, 0, jc_undef);
+        if (seed == kDefaultSeed) cpu_reference(is_jc, false, n, permutations, seed, x, local_sa, tc.w, p_seq, 0, jc_undef);
 
         // a pseudo p-value exactly where the CPU computes one, and nowhere else
         int wrong_slot = 0;
@@ -469,16 +523,21 @@ static void run(TestCase& tc, const char* lisa_path, const char* jc_path, int pe
         for (int i = 0; i < n; i++) {
             if (p_gpu[i] == untouched) continue;
             n_diff += p_gpu[i] != p_cpu[i];
-            max_diff_seq = std::max(max_diff_seq, fabs(p_gpu[i] - p_seq[i]));
+            // p_cpu, not p_gpu: the GPU counts every permutation inside the tie band as larger,
+            // which is a difference of arithmetic (bounded above), not Monte Carlo error
+            max_diff_seq = std::max(max_diff_seq, fabs(p_cpu[i] - p_seq[i]));
         }
         if (is_jc) {
             check(n_diff == 0, "identical to CPU");
         } else {
             check_tie_bounds(tc.name, bounds, one_period(p_cpu), one_period(p_gpu), tc.exact_arith);
         }
-        // difference of two independent Monte Carlo estimates, 6 standard errors
-        printf("  sequential seed: max p-value diff %g\n", max_diff_seq);
-        check(max_diff_seq <= 6 * sqrt(0.5 / permutations), "agrees with sequentially seeded CPU within Monte Carlo error");
+        // the keys of the GPU against one sequential random sequence: two independent Monte
+        // Carlo estimates.  Only with the default seed: the exact comparisons above are what
+        // the other seeds are for.
+        if (seed != kDefaultSeed) continue;
+        printf("  sequential seed: max p-value diff %g (limit %g)\n", max_diff_seq, monte_carlo_limit(permutations));
+        check(max_diff_seq <= monte_carlo_limit(permutations), "the keys of the GPU agree with sequentially seeded CPU within Monte Carlo error");
     }
 }
 
@@ -487,12 +546,13 @@ static void run(TestCase& tc, const char* lisa_path, const char* jc_path, int pe
 // weights (GalWeight::Update(), :333-341), while the draw rejection and the "no p-value"
 // test use the data undefs UNION the isolates of the original weights (:252-263, read at
 // :623 and :649).
-static void run_jc_undef(const TestCase& tc, const char* jc_path, int permutations)
+static void run_jc_undef(const TestCase& tc, const char* jc_path, int permutations,
+                         uint64_t seed = kDefaultSeed)
 {
-    const uint64_t seed = 123456789;
     const double untouched = -1;
     const int n = (int)tc.x.size();
-    printf("Local Join Count, undefined values (n=%d, permutations=%d)\n", n, permutations);
+    printf("Local Join Count, undefined values (n=%d, permutations=%d, seed=%llu)\n", n, permutations,
+           (unsigned long long)seed);
 
     std::vector<bool> data_undef(n, false), draw_undef(n, false);
     for (int i = 0; i < n; i++) {
@@ -563,7 +623,6 @@ static void cpu_variant_reference(const VariantCase& vc, std::vector<std::vector
     std::vector<int> perm_nbrs;
 
     for (int i = 0; i < n; i++) {
-        uint64_t seed_start = vc.seed + i;
         int num_nbrs = 0;
         for (int t = 0; t < T; t++) { // the largest count over the periods, upstream quirks included
             if (vc.w[t][i].Size() > num_nbrs) {
@@ -575,10 +634,12 @@ static void cpu_variant_reference(const VariantCase& vc, std::vector<std::vector
 
         std::vector<int> count(T, 0), count_lo(T, 0), count_hi(T, 0);
         for (int perm = 0; perm < permutations; perm++) {
+            uint64_t seed_start = permutation_key(vc.seed, i, perm);
             perm_nbrs.clear();
             while ((int)perm_nbrs.size() < num_nbrs) {
                 double rng_val = ThomasWangHashDouble(seed_start++) * (n - 1);
                 int r = (int)(rng_val < 0.0 ? ceil(rng_val - 0.5) : floor(rng_val + 0.5));
+                trace_draw(i, perm, r);
                 // the rejection reads the LAST period's weights, as the CPU's loop leaves them
                 if (r != i && !drawn[r] && vc.w[T - 1][r].Size() > 0) {
                     drawn[r] = true;
@@ -715,7 +776,8 @@ static VariantCase build_variant(const TestCase& tc, const std::string& name, in
 static void run_variant(VariantCase& vc, const char* lisa_path)
 {
     const int n = vc.n, T = vc.num_time_vals;
-    printf("%s (n=%d, periods=%d, permutations=%d)\n", vc.name.c_str(), n, T, vc.permutations);
+    printf("%s (n=%d, periods=%d, permutations=%d, seed=%llu)\n", vc.name.c_str(), n, T, vc.permutations,
+           (unsigned long long)vc.seed);
 
     const double untouched = -1;
     std::vector<std::vector<double> > p_cpu, p_gpu(T, std::vector<double>(n, untouched));
@@ -749,6 +811,80 @@ static void run_variant(VariantCase& vc, const char* lisa_path)
     check_tie_bounds(vc.name, bounds, p_cpu, p_gpu, false);
 }
 
+// ---------------------------------------------------------------------------
+// The keys (GPU-7).  The rule is stated here a second time, on purpose without the
+// helpers the references use: the d-th index that permutation q of observation i draws
+// (rejected ones included) comes from the key TW(TW(seed + i) + q) + d, TW being the
+// 64 bit Thomas Wang hash.  The expected values were computed outside this file with
+// arbitrary precision integers.  They include odd and adjacent q and seeds above 32 bits:
+// a key that drops the lowest bit of q or the upper half of seed + i fails here.  A change of the keys fails here even if kernels and
+// references are changed together (e.g. back to one running counter per observation).
+// ---------------------------------------------------------------------------
+static uint64_t pinned_hash(uint64_t k)
+{
+    k = ~k + (k << 21);
+    k ^= k >> 24;
+    k *= 265;
+    k ^= k >> 14;
+    k *= 21;
+    k ^= k >> 28;
+    k += k << 31;
+    return k;
+}
+
+static int pinned_index(uint64_t seed, int i, int q, int d, int n)
+{
+    uint64_t key = pinned_hash(pinned_hash(seed + (uint64_t)i) + (uint64_t)q) + (uint64_t)d;
+    return (int)floor(5.42101086242752217E-20 * pinned_hash(key) * (n - 1) + 0.5);
+}
+
+static void test_permutation_keys(const TestCase& tc)
+{
+    const int n = (int)tc.x.size(), n_pinned = 8, permutations = 9;
+    printf("keys of permutation q of observation i (n=%d)\n", n);
+    const struct { uint64_t seed; int i, q; int expected[8]; } pins[] = {
+        { 123456789ULL,           0, 0, { 44,  5, 72, 53, 26,  6, 79, 76 } },
+        { 123456789ULL,           3, 2, { 45, 82,  5, 29, 66, 56, 26, 16 } },
+        { 123456789ULL,          84, 8, { 58, 38, 18, 13, 77, 15, 63,  9 } },
+        { 18446744073709551615ULL, 3, 2, { 65, 58, 31,  1, 13, 45, 59, 21 } },  // seed + i wraps
+        { 18446744073709551614ULL, 84, 8, {  5, 50, 63,  1, 27, 34, 39, 82 } },
+        // odd q, next to q = 2 of the same observation: the lowest bit of q is part of the key
+        { 123456789ULL,           3, 1, { 51, 55, 31, 27,  3, 59, 26, 64 } },
+        { 123456789ULL,           3, 3, { 75, 66, 35, 21,  0, 75, 36, 30 } },
+        // seeds above 32 bits: the upper half of seed + i is part of the key
+        { 18364758544493064720ULL, 41, 7, { 37, 59,  3,  5, 13, 38, 68, 13 } }, // kSeed64
+        { 18446744073709551575ULL, 40, 5, { 51, 38, 61,  2, 14, 27, 65, 75 } }, // kSeedWrap: seed + i = 2^64 - 1
+        { 18446744073709551575ULL, 41, 5, { 36, 28,  3, 31, 68, 76, 10,  8 } }, // seed + i wraps to 0
+        { 4294967301ULL,          84, 8, { 12, 30, 47, 43, 70, 51, 26,  6 } },  // 2^32 + 5
+    };
+    if (!check(n == 85, "the pinned values are those of n = 85")) return;
+
+    // Local Moran, Local Join Count and a Local Moran variant: every reference in this file
+    std::vector<double> x = tc.x, zz(tc.zz.begin(), tc.zz.end()), local_sa(n, 1.0), p(n);
+    int formula_diff = 0, reference_diff = 0, traced = 0;
+    for (size_t c = 0; c < sizeof(pins) / sizeof(*pins); c++) {
+        for (int d = 0; d < n_pinned; d++)
+            formula_diff += pinned_index(pins[c].seed, pins[c].i, pins[c].q, d, n) != pins[c].expected[d];
+
+        VariantCase vc = build_variant(tc, "keys", 1, true, false, 0, permutations, pins[c].seed);
+        std::vector<std::vector<double> > p_variant;
+        TieBounds bounds;
+        for (int ref = 0; ref < 3; ref++) {
+            DrawTrace trace = { pins[c].i, pins[c].q, std::vector<int>() };
+            draw_trace = &trace;
+            if (ref < 2) cpu_reference(ref == 1, true, n, permutations, pins[c].seed, ref == 1 ? zz : x, local_sa, tc.w, p);
+            else cpu_variant_reference(vc, p_variant, bounds);
+            draw_trace = 0;
+            // a permutation draws at least as many indices as the observation has neighbors
+            reference_diff += trace.drawn.empty();
+            for (size_t d = 0; d < trace.drawn.size(); d++, traced++)
+                reference_diff += trace.drawn[d] != pinned_index(pins[c].seed, pins[c].i, pins[c].q, (int)d, n);
+        }
+    }
+    check(formula_diff == 0, "TW(TW(seed + i) + q) + d gives the pinned indices");
+    check(reference_diff == 0 && traced > 0, "the references draw from the keys TW(TW(seed + i) + q) + d");
+}
+
 int main(int argc, char* argv[])
 {
     const char* lisa_path = (argc > 1) ? argv[1] : "Algorithms/lisa_kernel.metal";
@@ -763,6 +899,7 @@ int main(int argc, char* argv[])
     TestCase g = sample_data("Guerry donatns, queen", guerry_n, guerry_x, guerry_nbr_offset, guerry_nbrs);
     TestCase u = sample_data("US Homicides hr90, queen", natregimes_n, natregimes_x, natregimes_nbr_offset, natregimes_nbrs);
     TestCase l = lattice(50);
+    test_permutation_keys(g);
     run(g, lisa_path, jc_path, 999);
     run(g, lisa_path, jc_path, 99999);
     run(u, lisa_path, jc_path, 999);
@@ -779,7 +916,7 @@ int main(int argc, char* argv[])
     run_jc_undef(u, jc_path, 999);
 
     // the other Local Moran variants on every test case
-    const uint64_t seed = 123456789;
+    const uint64_t seed = kDefaultSeed;
     const TestCase* cases[] = { &g, &u, &l, &d, &td };
     const char* case_names[] = { "Guerry", "US Homicides", "lattice", "dense", "tied values" };
     const struct {
@@ -798,6 +935,24 @@ int main(int argc, char* argv[])
                                            variants[v].num_time_vals, variants[v].bivariate,
                                            variants[v].median, variants[v].undef_every, 999, seed);
             run_variant(vc, lisa_path);
+        }
+    }
+
+    // Seeds above 32 bits on the GPU, every kernel: Local Moran and Local Join Count (run()),
+    // Join Count with undefined values, and the Local Moran kernels with undefined values,
+    // several time periods and the median (which has its own kernel function)
+    const uint64_t big_seeds[] = { kSeed64, kSeedWrap };
+    for (size_t b = 0; b < sizeof(big_seeds) / sizeof(*big_seeds); b++) {
+        run(g, lisa_path, jc_path, 999, big_seeds[b]);
+        run(l, lisa_path, jc_path, 999, big_seeds[b]);
+        run_jc_undef(l, jc_path, 999, big_seeds[b]);
+        for (size_t c = 0; c < 3; c += 2) {       // Guerry and the lattice
+            for (size_t v = 3; v < 6; v++) {      // 3 periods + undefined values, median, median + undefined
+                VariantCase vc = build_variant(*cases[c], std::string(case_names[c]) + ": " + variants[v].name,
+                                               variants[v].num_time_vals, variants[v].bivariate,
+                                               variants[v].median, variants[v].undef_every, 999, big_seeds[b]);
+                run_variant(vc, lisa_path);
+            }
         }
     }
 

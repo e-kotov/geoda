@@ -56,7 +56,7 @@ The essential code and numbers are inlined below so that this document stands on
 | GPU-4 | the GPU branch ignores `reuse_last_seed == false` | desktop (GPU) | CONFIRMED | same | medium | no |
 | GPU-5 | macOS bundle installs the kernels next to the binary, the code loads them from `Resources` | desktop (GPU) | CONFIRMED | every macOS release user who turns the GPU on | medium (the GPU option cannot work) | no |
 | GPU-6 | dead `gpu_distmatrix()`: 6 arguments set on a 4-argument kernel | desktop | COSMETIC-OR-DEAD-CODE | nobody | n/a | no |
-| GPU-7 | GPU seeding `seed_start = i + last_seed`: all observations share their Monte Carlo noise | desktop (OpenCL kernels, copied by the Metal port) | CONFIRMED by replay (`dev-notes/repro/gpu7_shared_noise/`) | every GPU run | medium: no bias, but the map is 2.5 to 4.8 times less stable between seeds than the CPU's | planned (re-keying of the four kernels) |
+| GPU-7 | GPU seeding `seed_start = i + last_seed`: all observations share their Monte Carlo noise | desktop (OpenCL kernels, copied by the Metal port) | CONFIRMED by replay (`dev-notes/repro/gpu7_shared_noise/`) and on the Metal kernels; fixed on this branch | every GPU run | medium: no bias, but the map is 2.5 to 4.8 times less stable between seeds than the CPU's | yes (all four kernels) |
 | LG-1 | libgeoda counts a self-link in the permutation size but not in the observed statistic | libgeoda | CONFIRMED | **rgeoda/pygeoda, any kernel weights** | medium (anti-conservative p-values) | no |
 | LG-2 | `row_standardize` is dead in libgeoda too; `UniG`/`UniGstar` would degenerate | libgeoda | CONFIRMED-LATENT | nobody | n/a | no |
 | LG-3 | NaN observed statistic, and NaN contagion into the cluster map | libgeoda | CONFIRMED | rgeoda with self-only or fully-undefined neighbourhoods | medium | no |
@@ -867,19 +867,59 @@ In counts: at n = 3,600 about 357 observations are significant; from seed to see
 GPU seeding and by +-5 with the CPU code. The excess grows with n. The GPU path is statistically worse than the CPU
 path it replaces, although both run the same number of permutations.
 
-**Reachability.** Every GPU run (OpenCL upstream once GPU-2/GPU-3 are fixed; Metal on this branch). CONFIRMED by
-replay; not yet measured on the kernels themselves.
+**Reachability.** Every GPU run (OpenCL upstream once GPU-2/GPU-3 are fixed; Metal on this branch before the fix).
+CONFIRMED by replay and measured on the real Metal kernels, before and after the fix (n = 3,600, 4 neighbours, 999
+permutations, 200 seeds, 5 data sets without spatial structure; metric as in the table above; two independent
+measurements with different data):
 
-**Proposed fix.** Start every permutation `q` of observation `i` from its own key,
-`hash(hash(seed + i) + q)`, and keep everything else (draw, rejection, comparison). Permutations become independent
-of each other, which also allows splitting a long run into several GPU dispatches without changing the result. The
-CPU code is not touched: its results stay as they are. GPU results for a given seed change; the GPU path is off by
-default and the OpenCL path did not work before this branch, so nobody depends on those numbers.
+| Statistic | before | after |
+|:--|--:|--:|
+| Local Moran | 4.05 and 4.09 | 1.02 and 0.98 |
+| Local Join Count (25 % ones) | 3.37 | 1.01 |
 
-**Testing.** The host reference in `Algorithms/test_metal_lisa.mm` replays the kernel's keys, so it changes with the
-kernel and the GPU == reference tests stay exact. New: the result must not depend on how the permutations are split
-into dispatches; the shared-noise measurement repeated on the real kernels, before and after.
+In counts (Local Moran, one data set): about 364 observations with p <= 0.05; seed to seed that number moves by
++-21.4 before and +-4.8 after (independent noise: +-5.1). The kernel and the host replay of the same keys gave
+identical p-values in these runs (0 of 3,600,000 differ), so the replay figures of the table above are those of the kernels.
 
+Nothing is biased, before or after. Null calibration on the real Metal kernels (iid data, n = 3,600, 4 neighbours,
+999 permutations, 40 data sets x 10 seeds; GeoDa's folded p gives P(p <= a) = 2a for a continuous statistic; Join
+Count is discrete, hence not 2a; standard errors over data sets in brackets):
+
+| Statistic | keys | P(p <= 0.05) | P(p <= 0.01) | P(p <= 0.001) | sd of the rate over runs (0.05) | mean p |
+|:--|:--|--:|--:|--:|--:|--:|
+| Local Moran (1,440,000 p) | before | 0.10103 (0.00089) | 0.02043 (0.00041) | 0.00202 | 0.00788 | 0.25045 |
+| | after | 0.10059 (0.00080) | 0.02021 (0.00039) | 0.00202 | 0.00517 | 0.25044 |
+| | replay of the desktop CPU seeding, 10 threads | 0.10062 (0.00082) | 0.02022 (0.00039) | 0.00202 | 0.00530 | 0.25042 |
+| Local Join Count (244,540 p) | before | 0.03809 (0.00217) | 0.00512 (0.00046) | 0.00012 | 0.02166 | 0.28070 |
+| | after | 0.03683 (0.00189) | 0.00513 (0.00046) | 0.00007 | 0.01274 | 0.28037 |
+| | replay of the desktop CPU seeding | 0.03692 (0.00192) | 0.00512 (0.00046) | 0.00010 | 0.01328 | 0.28038 |
+
+**Status: fixed on this branch** (all four kernels: `lisa_kernel.metal`, `localjc_kernel.metal`, `lisa_kernel.cl`,
+`localjc_kernel.cl`). Still present upstream.
+
+**Fix (this branch).** Every permutation `q` of observation `i` starts from its own key,
+`hash(hash(seed + i) + q)` (64 bit unsigned arithmetic), everything else is kept (draw, rejection, comparison). The
+key depends on (seed, observation, permutation number) only, so the result does not depend on the order in which
+permutations are computed; that is the precondition for splitting a long run into several GPU dispatches, which is
+NOT implemented. The CPU code is not touched: its results stay as they are. GPU results for a given seed change;
+the GPU path is off by default and the OpenCL path did not work before this branch, so nobody depends on those numbers.
+The OpenCL kernels on a CPU OpenCL device (PoCL, fp64) are bit-identical to the double replay of the same keys;
+Metal differs from OpenCL only at exact ties, which the CPU decides by roundoff and Metal always counts as larger.
+
+**Testing.** `Algorithms/test_metal_lisa.mm`: (1) the host references replay the kernels' keys, so every GPU ==
+reference comparison stays exact (BOUNDS rule at ties), for all kernels and variants, with the default seed and with
+two seeds above 32 bits, one of which makes `seed + i` wrap inside the data; (2) `test_permutation_keys()` states the
+rule a second time with its own hash and pins the drawn indices to literals computed outside the file (11 tuples:
+first, odd and adjacent `q`, seeds at 2^64 - 1, 2^64 - 41, 2^32 + 5, 0xFEDCBA9876543210), and requires every
+reference to draw exactly those: a change of the keys fails even if kernels and references are changed together;
+(3) the p-values of the GPU's keys agree with GeoDa's single sequential stream within a derived Monte Carlo bound.
+Mutants that these tests catch: the old running counter, either hash dropped, `q + 1`, `seed ^ i`, 32 bit
+truncation of either sum (kernels only, or kernels and references), the lowest bit of `q` ignored. Not in the
+shipped test: the shared-noise and calibration measurements above (run once by hand, harnesses untracked).
+
+Lead's check of the applied patch (2026-09-19): shipped test ALL PASSED (331 checks); the lead's held-out randomized
+tests, whose replay of the keys was written independently of the implementer, 140 Metal trials and 80 OpenCL trials
+(PoCL CPU device), 0 failures; all 18 GeoDa sample layers, raw and standardized: 10,544 checks, 0 failed.
 ---
 
 ## LG-1 — libgeoda counts a self-link in the permutation size but not in the observed statistic

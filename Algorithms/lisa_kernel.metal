@@ -1,9 +1,9 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Same draw as the CPU code: round(Gda::ThomasWangHashDouble(key) * max_rand),
-// i.e. round(hash * max_rand / 2^64), in integer arithmetic (no fp64 on Apple GPUs)
-inline int ThomasWangHashIndex(ulong key, ulong max_rand)
+// The 64 bit integer hash of Gda::ThomasWangHashDouble(), before it is scaled to a double
+// (a bijection on the keys)
+inline ulong ThomasWangHash(ulong key)
 {
     key = (~key) + (key << 21);
     key = key ^ (key >> 24);
@@ -12,7 +12,25 @@ inline int ThomasWangHashIndex(ulong key, ulong max_rand)
     key = (key + (key << 2)) + (key << 4);
     key = key ^ (key >> 28);
     key = key + (key << 31);
+    return key;
+}
+
+// Same draw as the CPU code: round(Gda::ThomasWangHashDouble(key) * max_rand),
+// i.e. round(hash * max_rand / 2^64), in integer arithmetic (no fp64 on Apple GPUs)
+inline int ThomasWangHashIndex(ulong key, ulong max_rand)
+{
+    key = ThomasWangHash(key);
     return (int)(mulhi(key, max_rand) + ((key * max_rand) >> 63));
+}
+
+// Keys (GPU-7 in dev-notes/UPSTREAM_BUGS.md): permutation q of observation i draws from
+// its own sequence of keys, which starts at ThomasWangHash(ThomasWangHash(last_seed + i) + q),
+// all in 64 bit unsigned arithmetic. The key depends on (last_seed, i, q) only, so the
+// result does not depend on the order in which the permutations are computed, and
+// observations do not share their Monte Carlo noise.
+inline ulong permutation_key(ulong obs_key, int q)
+{
+    return ThomasWangHash(obs_key + (ulong)q);
 }
 
 // There is no fp64 on Apple GPUs: the host passes each double as a 128 bit fixed point
@@ -182,7 +200,7 @@ kernel void lisa_metal(
         return;
     }
 
-    ulong seed_start = i + last_seed;
+    ulong obs_key = ThomasWangHash((ulong)i + last_seed);
     ulong max_rand = (ulong)(n - 1);
     int countLarger[N_PERIODS];
     for (int t = 0; t < N_PERIODS; t++) countLarger[t] = 0;
@@ -209,7 +227,8 @@ kernel void lisa_metal(
 
     for (int perm = 0; perm < permutations; perm++) {
         Lag drawn_lag = { {0, 0}, {0, 0}, 0 };
-        draw_permutation<fuse>(seed_start, (int)i, numNeighbors, max_rand, draw_ok,
+        ulong seed = permutation_key(obs_key, perm);
+        draw_permutation<fuse>(seed, (int)i, numNeighbors, max_rand, draw_ok,
                                table, slots, values, drawn_lag);
 
         // every time period reuses the same draw
@@ -330,7 +349,7 @@ kernel void lisa_median_metal(
         return;
     }
 
-    ulong seed_start = i + last_seed;
+    ulong obs_key = ThomasWangHash((ulong)i + last_seed);
     ulong max_rand = (ulong)(n - 1);
     int countLarger[N_PERIODS];
     for (int t = 0; t < N_PERIODS; t++) countLarger[t] = 0;
@@ -344,7 +363,8 @@ kernel void lisa_median_metal(
 
     for (int perm = 0; perm < permutations; perm++) {
         Lag unused = { {0, 0}, {0, 0}, 0 };
-        draw_permutation<false>(seed_start, (int)i, numNeighbors, max_rand, draw_ok,
+        ulong seed = permutation_key(obs_key, perm);
+        draw_permutation<false>(seed, (int)i, numNeighbors, max_rand, draw_ok,
                                 table, slots, values, unused);
 
         for (int t = 0; t < N_PERIODS; t++) {

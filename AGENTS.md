@@ -32,7 +32,7 @@ as is. The upstream PR is prepared on a separate clean branch, see below.
 | `Algorithms/test_data_guerry.h` | test data (generated) |
 | `Algorithms/test_data_natregimes.h` | test data (generated) |
 | `Algorithms/make_test_data.R` | generator of the test data headers |
-| `Algorithms/gpu_lisa.cpp`, `Algorithms/lisa_kernel.cl`, `Algorithms/localjc_kernel.cl` | OpenCL path fixed to reproduce the CPU test bit for bit (may become a separate PR: ask the user) |
+| `Algorithms/gpu_lisa.cpp`, `Algorithms/lisa_kernel.cl`, `Algorithms/localjc_kernel.cl` | OpenCL path fixed to reproduce the CPU test bit for bit, keys re-designed (GPU-7, needs its own argument: `dev-notes/UPSTREAM_BUGS.md`, `dev-notes/repro/gpu7_shared_noise/`) (may become a separate PR: ask the user) |
 | `Algorithms/GNUmakefile` | compiles `metal_lisa.mm` on macOS |
 | `GeoDamake.macosx.opt` | `.mm` rules, `-framework Metal -framework Foundation` |
 | `Explore/LisaCoordinator.cpp` | try Metal before OpenCL on macOS |
@@ -71,10 +71,16 @@ regenerate with `Rscript Algorithms/make_test_data.R` (needs R package `sf`).
 - The reference is the CPU code: `AbstractCoordinator::CalcPseudoP_range()` and
   `JCCoordinator::CalcPseudoP_range()`. OpenCL (`gpu_lisa.cpp`) can't be a reference:
   its fp64 kernels do not run on Apple Silicon.
-- Kernels draw exactly the CPU's random indices (`round(ThomasWangHashDouble(key) * (n-1))`
-  in integer arithmetic). The random sequence of observation `i` starts at `seed + i`,
-  as in the OpenCL kernels. With the same sequence the test requires **identical**
-  p-values, not "close" ones.
+- Kernels draw exactly the CPU's random indices (`round(ThomasWangHashDouble(key) * (n-1))` in integer arithmetic).
+  Keys (GPU-7): permutation `q` of observation `i` draws from its own key sequence, which starts at
+  `TW(TW(seed + i) + q)` (TW = the 64 bit integer hash inside `ThomasWangHashDouble`, 64 bit unsigned arithmetic,
+  wraparound intended), in the Metal AND the OpenCL kernels. This is NOT upstream's `seed_start = i + last_seed`
+  (one running counter per observation), which makes all observations share their Monte Carlo noise. The key depends
+  on (seed, i, q) only, so the result does not depend on the order in which permutations are computed. GPU results
+  for a given seed changed with GPU-7: they differ from those of earlier commits of this branch and from upstream's
+  OpenCL. With the same keys the test requires **identical** p-values, not "close" ones; `test_permutation_keys()`
+  pins the keys with literal values (odd and adjacent `q`, seeds above 32 bits), and every kernel runs against the
+  reference with two seeds above 32 bits.
 - Apple Silicon only (`MTLGPUFamilyApple7`, i.e. M1 and later); Intel Macs keep using OpenCL.
 - No fp64 on Apple GPUs: the host converts each double to a 128 bit fixed point integer and the kernel
   sums exactly (no floating point in the kernels). Float pairs (48 bits) were tried and are WRONG for real

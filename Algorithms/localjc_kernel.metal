@@ -1,9 +1,9 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Same draw as the CPU code: round(Gda::ThomasWangHashDouble(key) * max_rand),
-// i.e. round(hash * max_rand / 2^64), in integer arithmetic (no fp64 on Apple GPUs)
-inline int ThomasWangHashIndex(ulong key, ulong max_rand)
+// The 64 bit integer hash of Gda::ThomasWangHashDouble(), before it is scaled to a double
+// (a bijection on the keys)
+inline ulong ThomasWangHash(ulong key)
 {
     key = (~key) + (key << 21);
     key = key ^ (key >> 24);
@@ -12,7 +12,25 @@ inline int ThomasWangHashIndex(ulong key, ulong max_rand)
     key = (key + (key << 2)) + (key << 4);
     key = key ^ (key >> 28);
     key = key + (key << 31);
+    return key;
+}
+
+// Same draw as the CPU code: round(Gda::ThomasWangHashDouble(key) * max_rand),
+// i.e. round(hash * max_rand / 2^64), in integer arithmetic (no fp64 on Apple GPUs)
+inline int ThomasWangHashIndex(ulong key, ulong max_rand)
+{
+    key = ThomasWangHash(key);
     return (int)(mulhi(key, max_rand) + ((key * max_rand) >> 63));
+}
+
+// Keys (GPU-7 in dev-notes/UPSTREAM_BUGS.md): permutation q of observation i draws from
+// its own sequence of keys, which starts at ThomasWangHash(ThomasWangHash(last_seed + i) + q),
+// all in 64 bit unsigned arithmetic. The key depends on (last_seed, i, q) only, so the
+// result does not depend on the order in which the permutations are computed, and
+// observations do not share their Monte Carlo noise.
+inline ulong permutation_key(ulong obs_key, int q)
+{
+    return ThomasWangHash(obs_key + (ulong)q);
 }
 
 kernel void localjc_metal(
@@ -37,7 +55,7 @@ kernel void localjc_metal(
         return;
     }
 
-    ulong seed_start = i + last_seed;
+    ulong obs_key = ThomasWangHash((ulong)i + last_seed);
     ulong max_rand = (ulong)(n - 1);
     int countLarger = 0;
 
@@ -56,9 +74,10 @@ kernel void localjc_metal(
     for (int perm = 0; perm < permutations; perm++) {
         int rand = 0;
         int permutedLag = 0;
+        ulong seed = permutation_key(obs_key, perm);
 
         while (rand < numNeighbors) {
-            int newRandom = ThomasWangHashIndex(seed_start++, max_rand);
+            int newRandom = ThomasWangHashIndex(seed++, max_rand);
 
             // the draw rejects undefined observations, not neighborless ones
             if (newRandom != (int)i && draw_ok[newRandom] != 0) {

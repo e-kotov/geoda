@@ -23,8 +23,8 @@ public:
 #include "metal_lisa.mm"
 #include "test_data_natregimes.h" // GeoDa sample data, see make_test_data.R
 
-// Gda::ThomasWangHashDouble()
-inline double ThomasWangHashDouble(unsigned long long key)
+// The 64 bit integer hash of Gda::ThomasWangHashDouble(), before it is scaled to a double
+inline unsigned long long ThomasWangHash(unsigned long long key)
 {
     key = (~key) + (key << 21);
     key = key ^ (key >> 24);
@@ -33,7 +33,13 @@ inline double ThomasWangHashDouble(unsigned long long key)
     key = (key + (key << 2)) + (key << 4);
     key = key ^ (key >> 28);
     key = key + (key << 31);
-    return 5.42101086242752217E-20 * key;
+    return key;
+}
+
+// Gda::ThomasWangHashDouble()
+inline double ThomasWangHashDouble(unsigned long long key)
+{
+    return 5.42101086242752217E-20 * ThomasWangHash(key);
 }
 
 // Reference CPU implementation for a chunk of observations
@@ -50,7 +56,8 @@ void cpu_lisa_worker(int start_row, int end_row, int n, int permutations,
             continue;
         }
 
-        unsigned long long seed_start = i + last_seed;
+        // the keys of the GPU kernels: every permutation has its own sequence (GPU-7)
+        unsigned long long obs_key = ThomasWangHash((unsigned long long)i + last_seed);
         double max_rand = (double)(n - 1);
         int countLarger = 0;
 
@@ -59,6 +66,7 @@ void cpu_lisa_worker(int start_row, int end_row, int n, int permutations,
         }
 
         for (int perm = 0; perm < permutations; perm++) {
+            unsigned long long seed_start = ThomasWangHash(obs_key + (unsigned long long)perm);
             int rand_cnt = 0;
             double permutedLag = 0.0;
 

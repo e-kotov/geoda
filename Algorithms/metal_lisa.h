@@ -9,8 +9,11 @@ class GalElement;
 
 // Apple Metal counterparts of gpu_lisa() and gpu_localjoincount() (OpenCL is
 // deprecated on macOS and its fp64 kernels do not run on Apple Silicon GPUs).
-// Conditional permutation follows AbstractCoordinator::CalcPseudoP_range(),
-// with the random sequence of observation i starting at last_seed_used + i.
+// Conditional permutation follows AbstractCoordinator::CalcPseudoP_range(). Permutation
+// q of observation i draws from its own sequence of keys, which starts at
+// hash(hash(last_seed_used + i) + q), hash being the 64 bit integer hash of
+// Gda::ThomasWangHashDouble() (GPU-7 in dev-notes/UPSTREAM_BUGS.md): observations do not
+// share their Monte Carlo noise and the order of the permutations does not matter.
 // Return false if Metal can't be used.
 //
 // Ties: Apple GPUs have no fp64, so the kernels add the drawn values in exact 128 bit
