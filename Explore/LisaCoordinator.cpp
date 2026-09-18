@@ -111,6 +111,7 @@ LisaCoordinator(wxString weights_path,
     last_seed_used = 0;
     reuse_last_seed = false;
     isBivariate = false;
+    using_median = false;
 
     // std::vector<GdaVarTools::VarInfo> var_info;
     int num_vars = 1;
@@ -556,54 +557,101 @@ void LisaCoordinator::CalcPseudoP()
 {
     wxStopWatch sw_vd;
     
-    // The GPU code only computes the univariate Local Moran (mean of neighbors,
-    // row-standardized weights) of one time period without undefined values
-    bool gpu_ok = !isBivariate && !using_median && row_standardize &&
-                  num_time_vals == 1 && !has_undefined[0];
+    // The OpenCL code only computes the univariate Local Moran (mean of neighbors,
+    // row-standardized weights) of one time period without undefined values; Metal
+    // computes every variant but row_standardize == false, where the observed statistic
+    // is a mean and the permuted one a sum (upstream)
+    bool opencl_ok = !isBivariate && !using_median && row_standardize &&
+                     num_time_vals == 1 && !has_undefined[0];
+    bool metal_ok = false;
+#ifdef __WXMAC__
+    metal_ok = row_standardize && is_metal_supported();
+#endif
 
-    if (GdaConst::gda_use_gpu == false || !gpu_ok) {
+    if (GdaConst::gda_use_gpu == false || (!opencl_ok && !metal_ok)) {
         if (!calc_significances)
             return;
         CalcPseudoP_threaded();
         
     } else {
-        double* values = data1_vecs[0];
-        double* local_moran = local_moran_vecs[0];
-        GalElement* w = Gal_vecs[0]->gal; // as the CPU: without links to isolates
-        double* _sigLocal = sig_local_vecs[0];
-        
+        // A new random seed unless the user asked to reuse the last one: the CPU path
+        // does this in AbstractCoordinator::CalcPseudoP_threaded() (:458), which the GPU
+        // branch skips, so every GPU run used to return exactly the same p-values
+        // (dev-notes/UPSTREAM_BUGS.md, GPU-4).  If the GPU then refuses, the CPU path
+        // below draws again: same condition, same variable, same kind of seed.
+        if (!reuse_last_seed) last_seed_used = time(0);
+
         wxString exePath = GenUtils::GetExeDir();
-#ifdef __WXMAC__
-        wxString clPath = exePath + "../Resources/lisa_kernel.cl";
-#else
-        wxString clPath = exePath + "lisa_kernel.cl";
-#endif
         bool flag = false;
 #ifdef __WXMAC__
         // Apple Metal first: OpenCL is deprecated on macOS
-        wxString metalPath = exePath + "../Resources/lisa_kernel.metal";
-        flag = metal_lisa(metalPath.mb_str(), num_obs, permutations, last_seed_used, values, local_moran, w, _sigLocal);
+        if (metal_ok) {
+            GdaLisaPerm perm;
+            perm.rows = num_obs;
+            perm.permutations = permutations;
+            perm.num_time_vals = num_time_vals;
+            perm.last_seed_used = last_seed_used;
+            perm.using_median = using_median;
+            perm.undef = &undef_tms;
+            for (int t=0; t<num_time_vals; t++) {
+                double* lagged = data1_vecs[t];
+                if (isBivariate && !using_median) { // as LisaCoordinator::ComputeLarger()
+                    lagged = data2_vecs[0];
+                    if (var_info[1].is_time_variant && var_info[1].sync_with_global_time)
+                        lagged = data2_vecs[t];
+                }
+                perm.data1.push_back(data1_vecs[t]);
+                perm.lagged.push_back(lagged);
+                perm.lags.push_back(lags_vecs[t]);
+                perm.w.push_back(Gal_vecs[t]->gal); // as the CPU: without links to isolates
+            }
+            wxString metalPath = exePath + "../Resources/lisa_kernel.metal";
+            flag = metal_lisa(metalPath.mb_str(), perm, sig_local_vecs);
+        }
 #endif
-        if (!flag) flag = gpu_lisa(clPath.mb_str(), num_obs, permutations, last_seed_used, values, local_moran, w, _sigLocal);
+        if (!flag && opencl_ok) {
+#ifdef __WXMAC__
+            wxString clPath = exePath + "../Resources/lisa_kernel.cl";
+#else
+            wxString clPath = exePath + "lisa_kernel.cl";
+#endif
+            flag = gpu_lisa(clPath.mb_str(), num_obs, permutations, last_seed_used,
+                            data1_vecs[0], local_moran_vecs[0], Gal_vecs[0]->gal, sig_local_vecs[0]);
+        }
         
 		if (flag) {
 		   for (int cnt=0; cnt<num_obs; cnt++) {
-               int numNeighbors = w[cnt].Size();
-               int* _sigCat = sig_cat_vecs[0];
-               if (_sigLocal[cnt] <= 0.00001) _sigCat[cnt] = 5;
-               else if (_sigLocal[cnt] <= 0.0001) _sigCat[cnt] = 4;
-               else if (_sigLocal[cnt] <= 0.001) _sigCat[cnt] = 3;
-               else if (_sigLocal[cnt] <= 0.01) _sigCat[cnt] = 2;
-               else if (_sigLocal[cnt] <= 0.05) _sigCat[cnt]= 1;
-               else _sigCat[cnt]= 0;
-            
-               if (numNeighbors == 0) {
-                   _sigCat[cnt] = 6;
+               // neighbors to permute, as AbstractCoordinator::CalcPseudoP_range()
+               int numNeighbors = 0;
+               for (int t=0; t<num_time_vals; t++) {
+                   GalElement* w = Gal_vecs[t]->gal;
+                   if (w[cnt].Size() > numNeighbors) {
+                       numNeighbors = w[cnt].Size();
+                       if (w[cnt].Check(cnt)) numNeighbors -= 1;
+                   }
+               }
+               for (int t=0; t<num_time_vals; t++) {
+                   int* _sigCat = sig_cat_vecs[t];
+                   double* _sigLocal = sig_local_vecs[t];
+                   if (numNeighbors == 0) {
+                       _sigCat[cnt] = 6; // isolate: no permutation test
+                   }
+                   else if (_sigLocal[cnt] <= 0.00001) _sigCat[cnt] = 5;
+                   else if (_sigLocal[cnt] <= 0.0001) _sigCat[cnt] = 4;
+                   else if (_sigLocal[cnt] <= 0.001) _sigCat[cnt] = 3;
+                   else if (_sigLocal[cnt] <= 0.01) _sigCat[cnt] = 2;
+                   else if (_sigLocal[cnt] <= 0.05) _sigCat[cnt]= 1;
+                   else _sigCat[cnt]= 0;
                }
            }
 		} else {
-			wxMessageDialog dlg(NULL, "GeoDa can't configure GPU device. Default CPU solution will be used instead.", _("Error"), wxOK | wxICON_ERROR);
-			dlg.ShowModal();
+			// The variants only Metal computes never had a GPU path, so a refusal there
+			// is not an error the user has to be told about: fall back silently.  Where
+			// OpenCL was tried, keep the upstream message.
+			if (opencl_ok) {
+				wxMessageDialog dlg(NULL, "GeoDa can't configure GPU device. Default CPU solution will be used instead.", _("Error"), wxOK | wxICON_ERROR);
+				dlg.ShowModal();
+			}
 			if (!calc_significances)
 				return;
 			CalcPseudoP_threaded();

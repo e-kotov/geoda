@@ -20,9 +20,10 @@ kernel void localjc_metal(
     constant int &permutations            [[buffer(1)]],
     constant ulong &last_seed             [[buffer(2)]],
     device const int *num_nbrs            [[buffer(3)]],
-    device const int *zz                  [[buffer(4)]],
-    device const int *local_jc            [[buffer(5)]],
-    device int *count_larger              [[buffer(6)]],
+    device const uchar *draw_ok           [[buffer(4)]],
+    device const int *zz                  [[buffer(5)]],
+    device const int *local_jc            [[buffer(6)]],
+    device int *count_larger              [[buffer(7)]],
     uint i                                [[thread_position_in_grid]])
 {
     if (i >= (uint)n) {
@@ -30,7 +31,8 @@ kernel void localjc_metal(
     }
 
     int numNeighbors = num_nbrs[i];
-    if (local_jc[i] == 0 || numNeighbors <= 0) {
+    // undefined observations (draw_ok) are skipped, as JCCoordinator::CalcPseudoP_range()
+    if (draw_ok[i] == 0 || local_jc[i] == 0 || numNeighbors <= 0) {
         count_larger[i] = -1; // no permutation test
         return;
     }
@@ -58,7 +60,8 @@ kernel void localjc_metal(
         while (rand < numNeighbors) {
             int newRandom = ThomasWangHashIndex(seed_start++, max_rand);
 
-            if (newRandom != (int)i) {
+            // the draw rejects undefined observations, not neighborless ones
+            if (newRandom != (int)i && draw_ok[newRandom] != 0) {
 #if MAX_NBRS > 128
                 int slot = newRandom & (MAX_NBRS - 1);
                 while (drawn[slot] != -1 && drawn[slot] != newRandom) {

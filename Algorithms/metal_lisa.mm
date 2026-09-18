@@ -8,7 +8,9 @@
 #ifndef STANDALONE_TEST // test_metal_lisa.mm provides a wx-free GalElement
 #include "../ShapeOperations/GalWeight.h"
 #endif
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <map>
@@ -32,11 +34,14 @@ bool is_metal_supported()
     return metal_device() != nil;
 }
 
-// Compile (once per kernel and max_nbrs) the kernel from the .metal source
-static id<MTLComputePipelineState> metal_pipeline(const char* metal_path, NSString* kernel_name, int max_nbrs)
+// Compile (once per kernel and set of macros) the kernel from the .metal source
+static id<MTLComputePipelineState> metal_pipeline(const char* metal_path, NSString* kernel_name,
+                                                  int max_nbrs, int n_periods, bool has_undef)
 {
-    static std::map<std::pair<std::string, int>, id<MTLComputePipelineState> > cache;
-    std::pair<std::string, int> key([kernel_name UTF8String], max_nbrs);
+    static std::map<std::string, id<MTLComputePipelineState> > cache;
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s:%d:%d:%d", [kernel_name UTF8String], max_nbrs, n_periods, (int)has_undef);
+    std::string key(buf);
     if (cache.find(key) != cache.end()) return cache[key];
 
     NSError* error = nil;
@@ -47,7 +52,8 @@ static id<MTLComputePipelineState> metal_pipeline(const char* metal_path, NSStri
         return nil;
     }
     MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
-    options.preprocessorMacros = @{ @"MAX_NBRS" : @(max_nbrs) };
+    options.preprocessorMacros = @{ @"MAX_NBRS" : @(max_nbrs), @"N_PERIODS" : @(n_periods),
+                                    @"HAS_UNDEF" : @(has_undef ? 1 : 0) };
     id<MTLLibrary> library = [metal_device() newLibraryWithSource:src options:options error:&error];
     id<MTLFunction> func = library ? [library newFunctionWithName:kernel_name] : nil;
     id<MTLComputePipelineState> pipeline = func ? [metal_device() newComputePipelineStateWithFunction:func error:&error] : nil;
@@ -78,32 +84,27 @@ static Fixed128 to_fixed128(double x, int shift)
     return f;
 }
 
-// Number of neighbors (excluding self) to permute for each observation, 0 for isolates,
-// -1 if the only neighbor is the observation itself
-static bool metal_num_nbrs(int rows, GalElement* w, bool skip_isolates, std::vector<int>& num_nbrs, int& max_nbrs)
+static bool fixed128_less(const Fixed128& a, const Fixed128& b)
 {
-    int candidates = 0;
-    max_nbrs = 0;
-    num_nbrs.resize(rows);
-    for (int i = 0; i < rows; i++) {
-        num_nbrs[i] = (int)w[i].Size();
-        if (num_nbrs[i] > 0 || !skip_isolates) candidates++;
-        if (w[i].Check(i)) num_nbrs[i] -= 1;
-        // only neighbor is itself: no permutation test, but still drawn (CPU tests Size() > 0)
-        if (num_nbrs[i] == 0 && w[i].Size() > 0) num_nbrs[i] = -1;
-        if (num_nbrs[i] > max_nbrs) max_nbrs = num_nbrs[i];
-    }
-    // not enough observations to draw from: the permutation would never end
-    return max_nbrs < candidates;
+    return a.hi != b.hi ? (int64_t)a.hi < (int64_t)b.hi : a.lo < b.lo;
 }
 
-// Run the kernel for each observation. Kernel arguments are n, permutations, seed,
-// num_nbrs, inputs... and the output count_larger (< 0 means no permutation test)
+static Fixed128 fixed128_add(const Fixed128& a, const Fixed128& b)
+{
+    Fixed128 r;
+    r.lo = a.lo + b.lo;
+    r.hi = a.hi + b.hi + (r.lo < a.lo ? 1 : 0);
+    return r;
+}
+
+// Run the kernel for each observation. Kernel arguments are n, permutations, seed, the
+// inputs and the output count_larger, one count per time period and observation
+// (< 0 means no permutation test)
 typedef std::pair<const void*, size_t> MetalInput; // data, size in bytes
 
-static bool metal_run(const char* metal_path, NSString* kernel_name, int max_nbrs, int rows, int permutations,
-                      unsigned long long last_seed_used, const std::vector<int>& num_nbrs,
-                      std::vector<MetalInput> inputs, std::vector<int>& count_larger)
+static bool metal_run(const char* metal_path, NSString* kernel_name, int max_nbrs, int n_periods,
+                      bool has_undef, int rows, int permutations, unsigned long long last_seed_used,
+                      const std::vector<MetalInput>& inputs, std::vector<int>& count_larger)
 {
     @autoreleasepool {
         std::lock_guard<std::mutex> lock(s_metal_mutex);
@@ -115,7 +116,8 @@ static bool metal_run(const char* metal_path, NSString* kernel_name, int max_nbr
         // at most 0.5 (rounding up also limits recompilations)
         int buf_size = 64;
         while (buf_size < 2 * max_nbrs) buf_size *= 2;
-        id<MTLComputePipelineState> pipeline = metal_pipeline(metal_path, kernel_name, buf_size);
+        id<MTLComputePipelineState> pipeline = metal_pipeline(metal_path, kernel_name, buf_size,
+                                                              n_periods, has_undef);
         if (!queue || !pipeline) return false;
 
         id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
@@ -126,14 +128,13 @@ static bool metal_run(const char* metal_path, NSString* kernel_name, int max_nbr
         [encoder setBytes:&last_seed_used length:sizeof(unsigned long long) atIndex:2];
 
         // unified memory shared buffers
-        inputs.insert(inputs.begin(), MetalInput(num_nbrs.data(), sizeof(int)*rows));
         NSUInteger index = 3;
         for (size_t i = 0; i < inputs.size(); i++) {
             id<MTLBuffer> buf = [device newBufferWithBytes:inputs[i].first length:inputs[i].second options:MTLResourceStorageModeShared];
             if (!buf) return false;
             [encoder setBuffer:buf offset:0 atIndex:index++];
         }
-        id<MTLBuffer> bufCount = [device newBufferWithLength:sizeof(int)*rows options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bufCount = [device newBufferWithLength:sizeof(int)*rows*n_periods options:MTLResourceStorageModeShared];
         if (!bufCount) return false;
         [encoder setBuffer:bufCount offset:0 atIndex:index];
 
@@ -149,9 +150,159 @@ static bool metal_run(const char* metal_path, NSString* kernel_name, int max_nbr
             return false;
         }
         const int* result = (const int*)[bufCount contents];
-        count_larger.assign(result, result + rows);
+        count_larger.assign(result, result + rows * n_periods);
         return true;
     }
+}
+
+// Neighbors to draw for each observation and the observations the draw may pick, exactly
+// as AbstractCoordinator::CalcPseudoP_range(): the largest neighbor count over the time
+// periods (including its upstream quirks) minus a self-neighbor, and Size() > 0 in the
+// LAST period, the one its rejection rule reads.
+// Returns false when the CPU's draw could not terminate or when the sums could overflow.
+static bool metal_lisa_nbrs(const GdaLisaPerm& perm, std::vector<int>& num_nbrs,
+                            std::vector<unsigned char>& draw_ok, int& max_nbrs)
+{
+    const int rows = perm.rows, tms = perm.num_time_vals;
+    num_nbrs.assign(rows, 0);
+    draw_ok.assign(rows, 0);
+    max_nbrs = 0;
+    int candidates = 0;
+    for (int i = 0; i < rows; i++) {
+        for (int t = 0; t < tms; t++) {
+            GalElement* w = perm.w[t];
+            if (w[i].Size() > num_nbrs[i]) {
+                num_nbrs[i] = (int)w[i].Size();
+                if (w[i].Check(i)) num_nbrs[i] -= 1; // exclude self from neighbors
+            }
+        }
+        draw_ok[i] = perm.w[tms - 1][i].Size() > 0;
+        candidates += draw_ok[i];
+        if (num_nbrs[i] > max_nbrs) max_nbrs = num_nbrs[i];
+    }
+    // not enough observations to draw from: the permutation would never end.
+    // Fixed point values are below 2^110, so sumAbs + |lag_sum| < 2 k 2^110 = k 2^111
+    // stays below 2^127 exactly while k < 2^16: the bound is tight, not conservative.
+    return max_nbrs < candidates && max_nbrs < (1 << 16);
+}
+
+// The observed median times two, as the sum of the fixed point values of the one or two
+// middle neighbors, so that the kernel can compare it with the permuted median exactly
+// (LisaCoordinator::Calc():508-521 takes GenUtils::Median() of the non-self neighbors)
+static Fixed128 metal_median2(const GalElement& w, int i, const Fixed128* values,
+                              std::vector<Fixed128>& nbr_data)
+{
+    nbr_data.clear();
+    for (long j = 0, sz = w.Size(); j < sz; j++) {
+        if (w[j] != i) nbr_data.push_back(values[w[j]]);
+    }
+    Fixed128 zero = {0, 0};
+    if (nbr_data.empty()) return zero;
+    const size_t lo_rank = (nbr_data.size() - 1) / 2, hi_rank = nbr_data.size() / 2;
+    std::nth_element(nbr_data.begin(), nbr_data.begin() + hi_rank, nbr_data.end(), fixed128_less);
+    Fixed128 hi = nbr_data[hi_rank];
+    std::nth_element(nbr_data.begin(), nbr_data.begin() + lo_rank, nbr_data.begin() + hi_rank + 1,
+                     fixed128_less);
+    return fixed128_add(nbr_data[lo_rank], hi);
+}
+
+bool metal_lisa(const char* metal_path, const GdaLisaPerm& perm, const std::vector<double*>& p)
+{
+    const int rows = perm.rows, tms = perm.num_time_vals;
+    if (rows <= 0 || tms <= 0 || (int)perm.data1.size() < tms || (int)perm.lagged.size() < tms ||
+        (int)perm.lags.size() < tms || (int)perm.w.size() < tms || (int)p.size() < tms ||
+        (perm.undef && (int)perm.undef->size() < tms)) {
+        return false;
+    }
+
+    int max_nbrs = 0;
+    std::vector<int> num_nbrs, count_larger;
+    std::vector<unsigned char> draw_ok;
+    if (!metal_lisa_nbrs(perm, num_nbrs, draw_ok, max_nbrs)) return false;
+
+    // Only undefined observations that can be drawn change anything: they are left out of
+    // the permuted lag, which makes the number of valid neighbors vary from permutation to
+    // permutation. Isolates are undefined too, but are never drawn.
+    bool has_undef = false;
+    for (int t = 0; perm.undef && t < tms && !has_undef; t++) {
+        for (int i = 0; i < rows; i++) {
+            if ((*perm.undef)[t][i] && draw_ok[i]) { has_undef = true; break; }
+        }
+    }
+
+    // No fp64 on Apple GPUs: doubles are passed as 128 bit fixed point numbers (exact
+    // sums), one array per time period. value_sign is the sign of data1[i], which decides
+    // the direction of the comparison, and count_empty its answer when every drawn
+    // neighbor is undefined.
+    const size_t sz = (size_t)rows * tms;
+    std::vector<Fixed128> val(sz), lag(sz);
+    std::vector<int> value_sign(sz);
+    std::vector<unsigned char> undef(has_undef ? sz : 1, 0), count_empty(has_undef ? sz : 1, 0);
+    std::vector<Fixed128> nbr_data;
+
+    for (int t = 0; t < tms; t++) {
+        const double* data1 = perm.data1[t];
+        const double* lagged = perm.lagged[t];
+        const double* lags = perm.lags[t];
+        double max_abs = 0;
+        for (int i = 0; i < rows; i++) {
+            // data1[i] decides the direction of the comparison of EVERY observation,
+            // including the undefined ones (StandardizeData() leaves them a value), so a
+            // non-finite value there is refused too
+            if (!std::isfinite(data1[i])) return false;
+            if (perm.undef && (*perm.undef)[t][i]) continue; // undefined values are not lagged
+            if (!std::isfinite(lagged[i]) || !std::isfinite(lags[i])) return false;
+            if (fabs(lagged[i]) > max_abs) max_abs = fabs(lagged[i]);
+            if (fabs(lags[i]) > max_abs) max_abs = fabs(lags[i]);
+        }
+        // values become integers below 2^110 (the scale is a power of two: exact)
+        int exponent = 0;
+        frexp(max_abs, &exponent);
+        const int shift = 110 - exponent;
+        Fixed128* val_t = &val[(size_t)t * rows];
+        for (int i = 0; i < rows; i++) {
+            const bool is_undef = perm.undef && (*perm.undef)[t][i];
+            const size_t k = (size_t)t * rows + i;
+            val_t[i] = to_fixed128(is_undef ? 0 : lagged[i], shift);
+            value_sign[k] = (data1[i] > 0) - (data1[i] < 0);
+            if (!perm.using_median) {
+                lag[k] = to_fixed128(is_undef ? 0 : lags[i], shift); // lags[i] is 0 if undefined
+            }
+            if (has_undef) {
+                undef[k] = is_undef;
+                // local_moran[i] is data1[i] * lags[i], and 0 for undefined observations
+                count_empty[k] = is_undef || data1[i] * lags[i] <= 0;
+            }
+        }
+        if (perm.using_median) {
+            for (int i = 0; i < rows; i++) {
+                const bool is_undef = perm.undef && (*perm.undef)[t][i];
+                Fixed128 zero = {0, 0};   // Calc() leaves lags_vecs[t][i] at 0 for those
+                lag[(size_t)t * rows + i] = is_undef ? zero
+                                          : metal_median2(perm.w[t][i], i, val_t, nbr_data);
+            }
+        }
+    }
+
+    std::vector<MetalInput> inputs;
+    inputs.push_back(MetalInput(num_nbrs.data(), sizeof(int)*rows));
+    inputs.push_back(MetalInput(draw_ok.data(), draw_ok.size()));
+    inputs.push_back(MetalInput(undef.data(), undef.size()));
+    inputs.push_back(MetalInput(count_empty.data(), count_empty.size()));
+    inputs.push_back(MetalInput(value_sign.data(), sizeof(int)*sz));
+    inputs.push_back(MetalInput(val.data(), sizeof(Fixed128)*sz));
+    inputs.push_back(MetalInput(lag.data(), sizeof(Fixed128)*sz));
+    if (!metal_run(metal_path, perm.using_median ? @"lisa_median_metal" : @"lisa_metal",
+                   max_nbrs, tms, has_undef, rows, perm.permutations, perm.last_seed_used,
+                   inputs, count_larger)) return false;
+
+    for (int t = 0; t < tms; t++) {
+        for (int i = 0; i < rows; i++) {
+            int c = count_larger[(size_t)t * rows + i];
+            if (c >= 0) p[t][i] = (c + 1.0) / (perm.permutations + 1);
+        }
+    }
+    return true;
 }
 
 bool metal_lisa(const char* metal_path, int rows, int permutations, unsigned long long last_seed_used,
@@ -159,62 +310,60 @@ bool metal_lisa(const char* metal_path, int rows, int permutations, unsigned lon
 {
     if (rows <= 0) return false;
 
-    int max_nbrs = 0;
-    std::vector<int> num_nbrs, count_larger;
-    if (!metal_num_nbrs(rows, w, true, num_nbrs, max_nbrs)) return false;
-
-    // No fp64 on Apple GPUs: doubles are passed as 128 bit fixed point numbers (exact sums).
-    // permuted lag * values[i] >= local_moran[i] (row-standardized weights) is tested in the
-    // kernel as sum of permuted neighbors >=(<=) lag_sum[i] for positive (negative) values[i]
-    double max_abs = 0;
+    // the observed lag, which LisaCoordinator::Calc() keeps in lags_vecs
+    std::vector<double> lags(rows, 0);
     for (int i = 0; i < rows; i++) {
         if (!std::isfinite(values[i]) || !std::isfinite(local_moran[i])) return false;
-        if (fabs(values[i]) > max_abs) max_abs = fabs(values[i]);
-    }
-    // values become integers below 2^110: sums of less than 2^17 of them fit
-    int exponent = 0;
-    frexp(max_abs, &exponent);
-    int shift = 110 - exponent;
-    std::vector<Fixed128> val(rows), lag_sum(rows);
-    std::vector<int> value_sign(rows);
-    for (int i = 0; i < rows; i++) {
-        val[i] = to_fixed128(values[i], shift);
-        value_sign[i] = (values[i] > 0) - (values[i] < 0);
-        double s = values[i] != 0 ? local_moran[i] * num_nbrs[i] / values[i] : 0;
-        lag_sum[i] = to_fixed128(s, shift);
+        if (values[i] != 0) lags[i] = local_moran[i] / values[i];
     }
 
-    std::vector<MetalInput> inputs;
-    inputs.push_back(MetalInput(val.data(), sizeof(Fixed128)*rows));
-    inputs.push_back(MetalInput(lag_sum.data(), sizeof(Fixed128)*rows));
-    inputs.push_back(MetalInput(value_sign.data(), sizeof(int)*rows));
-    if (!metal_run(metal_path, @"lisa_metal", max_nbrs, rows, permutations, last_seed_used,
-                   num_nbrs, inputs, count_larger)) return false;
-
-    for (int i = 0; i < rows; i++) {
-        if (count_larger[i] >= 0) p[i] = (count_larger[i] + 1.0) / (permutations + 1);
-    }
-    return true;
+    GdaLisaPerm perm;
+    perm.rows = rows;
+    perm.permutations = permutations;
+    perm.num_time_vals = 1;
+    perm.last_seed_used = last_seed_used;
+    perm.data1.push_back(values);
+    perm.lagged.push_back(values);
+    perm.lags.push_back(lags.data());
+    perm.w.push_back(w);
+    return metal_lisa(metal_path, perm, std::vector<double*>(1, p));
 }
 
 bool metal_localjoincount(const char* metal_path, int rows, int permutations, unsigned long long last_seed_used,
-                          int num_vars, int* zz, double* local_jc, GalElement* w, double* p)
+                          int num_vars, int* zz, double* local_jc, GalElement* w, double* p,
+                          const std::vector<bool>* undef)
 {
     if (rows <= 0) return false;
 
-    int max_nbrs = 0;
-    std::vector<int> num_nbrs, count_larger;
-    if (!metal_num_nbrs(rows, w, false, num_nbrs, max_nbrs)) return false;
+    // Neighbors to permute (excluding a self-neighbor) and the observations the draw may
+    // pick: JCCoordinator::CalcPseudoP_range() rejects undefined observations, not
+    // neighborless ones, and computes nothing for an undefined observation.
+    int max_nbrs = 0, candidates = 0;
+    std::vector<int> num_nbrs(rows), count_larger;
+    std::vector<unsigned char> draw_ok(rows);
+    for (int i = 0; i < rows; i++) {
+        num_nbrs[i] = (int)w[i].Size();
+        if (w[i].Check(i)) num_nbrs[i] -= 1;
+        draw_ok[i] = undef ? !(*undef)[i] : 1;
+        candidates += draw_ok[i];
+        // observations the CPU skips (:623, :625) are not permuted by the kernel either
+        if (draw_ok[i] && local_jc[i] != 0 && num_nbrs[i] > max_nbrs) max_nbrs = num_nbrs[i];
+    }
+    // not enough observations to draw from: the permutation would never end
+    if (max_nbrs >= candidates) return false;
 
     std::vector<int> local_jc_i(local_jc, local_jc + rows);
 
     std::vector<MetalInput> inputs;
+    inputs.push_back(MetalInput(num_nbrs.data(), sizeof(int)*rows));
+    inputs.push_back(MetalInput(draw_ok.data(), draw_ok.size()));
     inputs.push_back(MetalInput(zz, sizeof(int)*rows));
     inputs.push_back(MetalInput(local_jc_i.data(), sizeof(int)*rows));
-    if (!metal_run(metal_path, @"localjc_metal", max_nbrs, rows, permutations, last_seed_used,
-                   num_nbrs, inputs, count_larger)) return false;
+    if (!metal_run(metal_path, @"localjc_metal", max_nbrs, 1, undef != 0, rows, permutations,
+                   last_seed_used, inputs, count_larger)) return false;
 
     for (int i = 0; i < rows; i++) {
+        if (undef && (*undef)[i]) continue; // no pseudo p-value for undefined observations
         if (local_jc[i] == 0) p[i] = 0;
         else if (count_larger[i] >= 0) p[i] = (count_larger[i] + 1.0) / (permutations + 1.0);
     }

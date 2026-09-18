@@ -463,53 +463,54 @@ void JCCoordinator::CalcPseudoP()
         }
     } else {
         for (int t=0; t<num_time_vals; t++) {
-            if (has_undefined[t]) {
-                // the GPU code doesn't handle undefined values
+            // the OpenCL code doesn't handle undefined values, Metal does
+            bool opencl_ok = !has_undefined[t];
+            bool metal_ok = false;
+#ifdef __WXMAC__
+            metal_ok = is_metal_supported();
+#endif
+            if (!opencl_ok && !metal_ok) {
                 CalcPseudoP_threaded(t);
                 continue;
             }
-            std::vector<int> local_t;
-            for (int v=0; v<num_vars; v++) {
-                if (data_vecs[v].size()==1) {
-                    local_t.push_back(0);
-                } else {
-                    local_t.push_back(t);
-                }
-            }
-            
+            // A new random seed unless the user asked to reuse the last one, exactly
+            // where the CPU path does it: JCCoordinator::CalcPseudoP_threaded() draws
+            // one per time period.  The GPU branch skipped it, so every GPU run returned
+            // the same p-values (dev-notes/UPSTREAM_BUGS.md, GPU-4).  A later fallback to
+            // CalcPseudoP_threaded(t) draws again, which is what a CPU run would do.
+            if (!reuse_last_seed) last_seed_used = time(0);
+
             int* zz = zz_vecs[t];
-            
-            double* values = new double[num_vars * num_obs];
-            for (int v=0; v<num_vars; v++) {
-                for (int j=0; j<num_obs; j++) {
-                    int _t = local_t[v];
-                    values[v*num_obs + j] = data_vecs[v][_t][j];
-                }
-            }
-            
             double* local_jc = local_jc_vecs[t];
             GalElement* w = Gal_vecs[t]->gal;
             double* _sigLocal = sig_local_jc_vecs[t];
             
             wxString exePath = GenUtils::GetExeDir();
-#ifdef __WXMAC__
-            wxString clPath = exePath + "../Resources/localjc_kernel.cl";
-#else
-            wxString clPath = exePath + "localjc_kernel.cl";
-#endif
             bool flag = false;
 #ifdef __WXMAC__
             // Apple Metal first: OpenCL is deprecated on macOS
-            wxString metalPath = exePath + "../Resources/localjc_kernel.metal";
-            flag = metal_localjoincount(metalPath.mb_str(), num_obs, permutations, last_seed_used, num_vars, zz, local_jc, w, _sigLocal);
+            if (metal_ok) {
+                wxString metalPath = exePath + "../Resources/localjc_kernel.metal";
+                flag = metal_localjoincount(metalPath.mb_str(), num_obs, permutations, last_seed_used, num_vars, zz, local_jc, w, _sigLocal, &undef_tms[t]);
+            }
 #endif
-            if (!flag) flag = gpu_localjoincount(clPath.mb_str(), num_obs, permutations, last_seed_used, num_vars, zz, local_jc, w, _sigLocal);
-            
-            delete[] values;
+            if (!flag && opencl_ok) {
+#ifdef __WXMAC__
+                wxString clPath = exePath + "../Resources/localjc_kernel.cl";
+#else
+                wxString clPath = exePath + "localjc_kernel.cl";
+#endif
+                flag = gpu_localjoincount(clPath.mb_str(), num_obs, permutations, last_seed_used, num_vars, zz, local_jc, w, _sigLocal);
+            }
             
             if (!flag) {
-                wxMessageDialog dlg(NULL, "GeoDa can't configure GPU device. Default CPU solution will be used instead.", _("Error"), wxOK | wxICON_ERROR);
-                dlg.ShowModal();
+                // Metal handles time periods with undefined values, which OpenCL never
+                // did: a refusal there falls back to the CPU silently (see
+                // LisaCoordinator::CalcPseudoP()), the OpenCL case keeps the message.
+                if (opencl_ok) {
+                    wxMessageDialog dlg(NULL, "GeoDa can't configure GPU device. Default CPU solution will be used instead.", _("Error"), wxOK | wxICON_ERROR);
+                    dlg.ShowModal();
+                }
                 CalcPseudoP_threaded(t);
             }
         }
