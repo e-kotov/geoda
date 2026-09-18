@@ -176,6 +176,24 @@ static TestCase lattice(int side)
     return tc;
 }
 
+// more than 64 neighbors (kernel work array is resized), unstandardized values of large
+// magnitude with exact zeros and ties, one observation linked to all others
+static TestCase dense(int n, int k)
+{
+    TestCase tc;
+    tc.name = "dense weights, 100 neighbors, unstandardized";
+    tc.w.resize(n);
+    for (int i = 0; i < n; i++) {
+        double v = floor(ThomasWangHashDouble(i + 1000) * 20) - 5;
+        tc.x.push_back(v * 1e6);
+        tc.zz.push_back(v > 8);
+        int ki = (i == 0) ? n - 1 : k;
+        tc.w[i].SetSizeNbrs(ki);
+        for (int j = 0; j < ki; j++) tc.w[i].SetNbr(j, (i + 1 + j) % n);
+    }
+    return tc;
+}
+
 static int failures = 0;
 
 static void check(bool ok, const char* what)
@@ -249,6 +267,20 @@ int main(int argc, char* argv[])
     run(g, lisa_path, jc_path, 99999);
     run(u, lisa_path, jc_path, 999);
     run(l, lisa_path, jc_path, 999);
+
+    TestCase d = dense(200, 100);
+    run(d, lisa_path, jc_path, 999);
+
+    // an isolate leaves too few observations to draw 3 neighbors from: the CPU code
+    // would never finish, the GPU code must refuse
+    std::vector<GalElement> w(4);
+    w[0].SetSizeNbrs(3);
+    for (int j = 0; j < 3; j++) w[0].SetNbr(j, j + 1);
+    w[1].SetSizeNbrs(1); w[1].SetNbr(0, 0);
+    w[2].SetSizeNbrs(1); w[2].SetNbr(0, 0);
+    double x4[4] = {1, -1, 2, 0}, lm4[4] = {0.3, -1, 2, 0}, p4[4];
+    printf("too few observations to permute\n");
+    check(!metal_lisa(lisa_path, 4, 99, 1, x4, lm4, w.data(), p4), "metal_lisa() returns false");
 
     printf(failures ? "%d CHECK(S) FAILED\n" : "ALL METAL TESTS PASSED\n", failures);
     return failures ? 1 : 0;
