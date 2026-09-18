@@ -93,9 +93,10 @@ static bool metal_run(const char* metal_path, NSString* kernel_name, int max_nbr
         if (!device) return false;
         static id<MTLCommandQueue> queue = [device newCommandQueue];
 
-        // round up the size of kernel's work array to limit recompilations
+        // size of kernel's hash table of drawn observations: power of 2, load factor
+        // at most 0.5 (rounding up also limits recompilations)
         int buf_size = 64;
-        while (buf_size < max_nbrs) buf_size *= 2;
+        while (buf_size < 2 * max_nbrs) buf_size *= 2;
         id<MTLComputePipelineState> pipeline = metal_pipeline(metal_path, kernel_name, buf_size);
         if (!queue || !pipeline) return false;
 

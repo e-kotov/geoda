@@ -47,7 +47,17 @@ kernel void lisa_metal(
     ulong max_rand = (ulong)(n - 1);
     int countLarger = 0;
 
-    int rnd_numbers[MAX_NBRS];
+    // Observations drawn in the current permutation. MAX_NBRS is a power of 2, at least
+    // twice the largest number of neighbors. Duplicates are found by scanning rnd_numbers
+    // if there are at most 64 neighbors, otherwise with an open addressing
+    // hash table
+#if MAX_NBRS > 128
+    int drawn[MAX_NBRS];
+    int used_slots[MAX_NBRS / 2];
+    for (int j = 0; j < MAX_NBRS; j++) drawn[j] = -1;
+#else
+    int rnd_numbers[MAX_NBRS / 2];
+#endif
 
     for (int perm = 0; perm < permutations; perm++) {
         int rand = 0;
@@ -57,6 +67,13 @@ kernel void lisa_metal(
             int newRandom = ThomasWangHashIndex(seed_start++, max_rand);
 
             if (newRandom != (int)i && num_nbrs[newRandom] > 0) {
+#if MAX_NBRS > 128
+                int slot = newRandom & (MAX_NBRS - 1);
+                while (drawn[slot] != -1 && drawn[slot] != newRandom) {
+                    slot = (slot + 1) & (MAX_NBRS - 1);
+                }
+                bool is_valid = drawn[slot] == -1;
+#else
                 bool is_valid = true;
                 for (int j = 0; j < rand; j++) {
                     if (newRandom == rnd_numbers[j]) {
@@ -64,6 +81,7 @@ kernel void lisa_metal(
                         break;
                     }
                 }
+#endif
                 if (is_valid) {
                     // Knuth's TwoSum: s + err == permutedLag + values[newRandom] exactly
                     float s = permutedLag + values[newRandom];
@@ -71,11 +89,19 @@ kernel void lisa_metal(
                     float err = (permutedLag - (s - t)) + (values[newRandom] - t);
                     permutedLag = s;
                     permutedLag_lo += err + values_lo[newRandom];
+#if MAX_NBRS > 128
+                    drawn[slot] = newRandom;
+                    used_slots[rand] = slot;
+#else
                     rnd_numbers[rand] = newRandom;
+#endif
                     rand++;
                 }
             }
         }
+#if MAX_NBRS > 128
+        for (int j = 0; j < numNeighbors; j++) drawn[used_slots[j]] = -1;
+#endif
 
         float diff = (permutedLag - lag_sum[i]) + (permutedLag_lo - lag_sum_lo[i]);
         if ((values[i] > 0 && diff > tie_tol) || (values[i] < 0 && diff < -tie_tol)) {
