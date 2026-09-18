@@ -83,8 +83,10 @@ regenerate with `Rscript Algorithms/make_test_data.R` (needs R package `sf`).
 - Scope: all OpenCL code that GeoDa actually calls is covered (`gpu_lisa`,
   `gpu_localjoincount`). `gpu_distmatrix` / `distmat_kernel.cl` is dead code upstream
   (never called, kernel not packaged) and is intentionally not ported.
-- Known upstream limitations of the GPU code path, shared with OpenCL and left for a
-  separate PR: it is also taken for bivariate LISA, median LISA, data with undefined
-  values and multiple time periods, which it does not handle; it ignores
-  `reuse_last_seed == false`.
+- The GPU code path (Metal and OpenCL) only computes the univariate Local Moran (mean, row-standardized
+  weights, one time period, no undefined values) and Local Join Count without undefined values. Upstream
+  took it for everything (wrong p-values for e.g. bivariate LISA, verified with GeoDa's OpenCL code); the
+  guards in `LisaCoordinator::CalcPseudoP()` and `JCCoordinator::CalcPseudoP()` are part of the PR.
+  Still upstream and untouched: the GPU branch ignores `reuse_last_seed == false`; the OpenCL kernel
+  itself differs from the CPU (`>` instead of `>=`, truncated random index, isolates, self-neighbors).
 - Keep the diff against upstream minimal: no UI, no popups, no timing code in `Explore/`.

@@ -556,7 +556,12 @@ void LisaCoordinator::CalcPseudoP()
 {
     wxStopWatch sw_vd;
     
-    if (GdaConst::gda_use_gpu == false) {
+    // The GPU code only computes the univariate Local Moran (mean of neighbors,
+    // row-standardized weights) of one time period without undefined values
+    bool gpu_ok = !isBivariate && !using_median && row_standardize &&
+                  num_time_vals == 1 && !has_undefined[0];
+
+    if (GdaConst::gda_use_gpu == false || !gpu_ok) {
         if (!calc_significances)
             return;
         CalcPseudoP_threaded();

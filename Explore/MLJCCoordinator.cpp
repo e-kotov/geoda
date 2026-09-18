@@ -463,6 +463,11 @@ void JCCoordinator::CalcPseudoP()
         }
     } else {
         for (int t=0; t<num_time_vals; t++) {
+            if (has_undefined[t]) {
+                // the GPU code doesn't handle undefined values
+                CalcPseudoP_threaded(t);
+                continue;
+            }
             std::vector<int> local_t;
             for (int v=0; v<num_vars; v++) {
                 if (data_vecs[v].size()==1) {
