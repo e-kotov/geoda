@@ -19,8 +19,10 @@ static std::mutex s_metal_mutex;
 
 static id<MTLDevice> metal_device()
 {
+    // Apple Silicon only (M1 is MTLGPUFamilyApple7): Intel Macs fall back to OpenCL
     static id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    return device;
+    static bool supported = device && [device supportsFamily:MTLGPUFamilyApple7];
+    return supported ? device : nil;
 }
 
 bool is_metal_supported()

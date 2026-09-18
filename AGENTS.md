@@ -72,6 +72,7 @@ regenerate with `Rscript Algorithms/make_test_data.R` (needs R package `sf`).
   in integer arithmetic). The random sequence of observation `i` starts at `seed + i`,
   as in the OpenCL kernels. With the same sequence the test requires **identical**
   p-values, not "close" ones.
+- Apple Silicon only (`MTLGPUFamilyApple7`, i.e. M1 and later); Intel Macs keep using OpenCL.
 - No fp64 on Apple GPUs: doubles are passed as (high, low) float pairs, sums use TwoSum,
   kernels are compiled with fast math **off**. Permutations tied with the observed value
   (difference below `tie_tol`) are never counted as larger; the CPU decides such ties by
