@@ -32,6 +32,7 @@ as is. The upstream PR is prepared on a separate clean branch, see below.
 | `Algorithms/test_data_guerry.h` | test data (generated) |
 | `Algorithms/test_data_natregimes.h` | test data (generated) |
 | `Algorithms/make_test_data.R` | generator of the test data headers |
+| `Algorithms/gpu_lisa.cpp`, `Algorithms/lisa_kernel.cl`, `Algorithms/localjc_kernel.cl` | OpenCL path fixed to reproduce the CPU test bit for bit (may become a separate PR: ask the user) |
 | `Algorithms/GNUmakefile` | compiles `metal_lisa.mm` on macOS |
 | `GeoDamake.macosx.opt` | `.mm` rules, `-framework Metal -framework Foundation` |
 | `Explore/LisaCoordinator.cpp` | try Metal before OpenCL on macOS |
@@ -87,6 +88,9 @@ regenerate with `Rscript Algorithms/make_test_data.R` (needs R package `sf`).
   weights, one time period, no undefined values) and Local Join Count without undefined values. Upstream
   took it for everything (wrong p-values for e.g. bivariate LISA, verified with GeoDa's OpenCL code); the
   guards in `LisaCoordinator::CalcPseudoP()` and `JCCoordinator::CalcPseudoP()` are part of the PR.
-  Still upstream and untouched: the GPU branch ignores `reuse_last_seed == false`; the OpenCL kernel
-  itself differs from the CPU (`>` instead of `>=`, truncated random index, isolates, self-neighbors).
+  Still upstream and untouched: the GPU branch ignores `reuse_last_seed == false`.
+- The OpenCL kernels were fixed on this branch to give p-values bit-identical to the CPU algorithm
+  (verified on PoCL, a CPU OpenCL runtime with fp64; harness in the untracked `private/opencl_fix/`).
+- Anti-overfitting rule: besides the fixed datasets, every GPU implementation must pass a held-out
+  randomized GPU vs CPU test (untracked `private/fuzz/`) that the implementer does not edit.
 - Keep the diff against upstream minimal: no UI, no popups, no timing code in `Explore/`.
