@@ -41,5 +41,7 @@ jobs:
             -o Algorithms/test_metal_lisa
 
       - name: Run Metal Permutation Test on Apple Silicon GPU
+        env:
+          GEODA_METAL_ANY_GPU: 1 # GitHub runners have a paravirtual GPU
         run: |
           ./Algorithms/test_metal_lisa Algorithms/lisa_kernel.metal Algorithms/localjc_kernel.metal

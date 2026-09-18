@@ -9,6 +9,7 @@
 #include "../ShapeOperations/GalWeight.h"
 #endif
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -21,7 +22,8 @@ static id<MTLDevice> metal_device()
 {
     // Apple Silicon only (M1 is MTLGPUFamilyApple7): Intel Macs fall back to OpenCL
     static id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    static bool supported = device && [device supportsFamily:MTLGPUFamilyApple7];
+    // (GEODA_METAL_ANY_GPU: for tests on the paravirtual GPU of CI runners)
+    static bool supported = device && ([device supportsFamily:MTLGPUFamilyApple7] || getenv("GEODA_METAL_ANY_GPU"));
     return supported ? device : nil;
 }
 
