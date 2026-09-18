@@ -812,6 +812,19 @@ int main(int argc, char* argv[])
     printf("too few observations to permute\n");
     check(!metal_lisa(lisa_path, 4, 99, 1, x4, lm4, w.data(), p4), "metal_lisa() returns false");
 
+    // rows * time periods beyond 32 bits: the kernel's t * n + i would wrap, so the GPU
+    // code must refuse before it reads or allocates anything (the pointers are NULL)
+    GdaLisaPerm big;
+    big.rows = 1 << 30;
+    big.num_time_vals = 2;
+    big.permutations = 99;
+    big.data1.assign(2, (double*)0);
+    big.lagged.assign(2, (double*)0);
+    big.lags.assign(2, (double*)0);
+    big.w.assign(2, (GalElement*)0);
+    printf("rows * time periods does not fit in 32 bits\n");
+    check(!metal_lisa(lisa_path, big, std::vector<double*>(2, (double*)0)), "metal_lisa() returns false");
+
     printf(failures ? "%d CHECK(S) FAILED\n" : "ALL METAL TESTS PASSED\n", failures);
     return failures ? 1 : 0;
 }

@@ -8,6 +8,7 @@
 #ifndef STANDALONE_TEST // test_metal_lisa.mm provides a wx-free GalElement
 #include "../ShapeOperations/GalWeight.h"
 #endif
+#include <climits>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -209,6 +210,8 @@ static Fixed128 metal_median2(const GalElement& w, int i, const Fixed128* values
 bool metal_lisa(const char* metal_path, const GdaLisaPerm& perm, const std::vector<double*>& p)
 {
     const int rows = perm.rows, tms = perm.num_time_vals;
+    // the kernel indexes the time periods as t * n + i in 32 bit integers
+    if (rows > 0 && tms > 0 && (long long)rows * tms > INT_MAX) return false;
     if (rows <= 0 || tms <= 0 || (int)perm.data1.size() < tms || (int)perm.lagged.size() < tms ||
         (int)perm.lags.size() < tms || (int)perm.w.size() < tms || (int)p.size() < tms ||
         (perm.undef && (int)perm.undef->size() < tms)) {
