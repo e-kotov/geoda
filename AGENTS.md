@@ -47,7 +47,7 @@ as is. The upstream PR is prepared on a separate clean branch, see below.
 
 ### Never copy (fork-only)
 
-`AGENTS.md`, `Algorithms/benchmark_lisa.mm`, `.github/workflows/benchmark.yml`,
+`AGENTS.md`, `dev-notes/` (bug register `dev-notes/UPSTREAM_BUGS.md`: source material for SEPARATE upstream PRs and issues), `Algorithms/benchmark_lisa.mm`, `.github/workflows/benchmark.yml`,
 `.github/workflows/fork_release.yml`, `.github/workflows/osx_build.yml`,
 `BuildTools/macosx/create-dmg/geoda.sh`, `BuildTools/macosx/install_name.py`.
 `GdaConst.cpp` must be identical to upstream (GPU stays off by default).
