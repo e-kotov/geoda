@@ -43,7 +43,9 @@ as is. The upstream PR is prepared on a separate clean branch, see below.
 
 - `BuildTools/macosx/GNUmakefile`: take **only** the two lines that copy
   `lisa_kernel.metal` and `localjc_kernel.metal` to `build/GeoDa.app/Contents/Resources`.
-  Everything else changed in that file (ad-hoc code signing, extra `.cl` copies) is fork-only.
+  The two lines copying `lisa_kernel.cl` and `localjc_kernel.cl` to `Contents/Resources` fix upstream bug GPU-5
+  (`dev-notes/UPSTREAM_BUGS.md`: the app reads kernels from `Resources`, upstream installs them only to `Contents/MacOS`):
+  they belong to the OpenCL-fix PR. Everything else changed in that file (ad-hoc code signing) is fork-only.
 
 ### Never copy (fork-only)
 
