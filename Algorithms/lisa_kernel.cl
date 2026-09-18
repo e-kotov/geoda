@@ -1,126 +1,8 @@
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
+// the CPU arithmetic must be reproduced exactly: no fused multiply-add
+#pragma OPENCL FP_CONTRACT OFF
 
-#define BUCKET_EMPTY -1
-
-int hash_code(uint key, uint capacity)
-{
-    return key % capacity;
-}
-
-void init_bucket(int* bucket, uint capacity)
-{
-    for (size_t i=0; i<capacity; ++i) {
-        bucket[i] = BUCKET_EMPTY;
-    }
-}
-
-void insert_bucket(uint key, int *bucket, uint capacity)
-{
-    int hashIndex = hash_code(key, capacity);
-
-    //find next free space
-    while (bucket[hashIndex] != key && bucket[hashIndex] != BUCKET_EMPTY) {
-        hashIndex++;
-        hashIndex %= capacity;
-    }
-
-    // make sure that insert_bucket() will not overfill the bucket
-    // todo:
-
-    bucket[hashIndex] = key;
-}
-
-bool search_bucket(uint key, int *bucket, uint capacity)
-{
-    // Apply hash function to find index for given key
-    int hashIndex = hash_code(key, capacity);
-    int counter=0;
-
-    //finding the node with given key
-    while (counter++ < capacity) { //to avoid infinite loop
-
-        if (bucket[hashIndex] == BUCKET_EMPTY)
-            return false;
-
-        //if node found return true
-        if(bucket[hashIndex] == key)
-            return true;
-
-        hashIndex++;
-        hashIndex %= capacity;
-    }
-
-    //If not found return false
-    return false;
-}
-
-struct Dict {
-    int key;
-    int val;
-};
-
-typedef struct Dict Dict;
-
-void init_dict(Dict *arr, uint capacity)
-{
-    for (size_t i=0; i<capacity; ++i) {
-        arr[i].key = BUCKET_EMPTY;
-    }
-}
-
-void insert_dict(uint key, uint val, Dict *arr, uint capacity)
-{
-    int hashIndex = hash_code(key, capacity);
-
-    //find next free space
-    while (arr[hashIndex].key != key && arr[hashIndex].key != BUCKET_EMPTY) {
-        hashIndex++;
-        hashIndex %= capacity;
-    }
-
-    // make sure that insert_dict() will not overfill the bucket
-    // todo:
-
-    arr[hashIndex].key = key;
-    arr[hashIndex].val = val;
-}
-
-bool search_dict(uint key, Dict *arr, uint capacity)
-{
-    // Apply hash function to find index for given key
-    int hashIndex = hash_code(key, capacity);
-    int counter=0;
-
-    //finding the node with given key
-    while (counter++ < capacity) { //to avoid infinite loop
-
-        //if node found return true
-        if(arr[hashIndex].key == key)
-            return arr[hashIndex].val;
-
-        hashIndex++;
-        hashIndex %= capacity;
-    }
-
-    //If not found return false
-    return BUCKET_EMPTY;
-}
-
-float wang_rnd(uint seed);
-float wang_rnd(uint seed)
-{
-    uint maxint=0;
-    maxint--; // not ok but works
-    
-    seed = (seed ^ 61) ^ (seed >> 16);
-    seed *= 9;
-    seed = seed ^ (seed >> 4);
-    seed *= 0x27d4eb2d;
-    seed = seed ^ (seed >> 15);
-    
-    return ((float)seed)/(float)maxint;
-}
-
+// Gda::ThomasWangHashDouble()
 double ThomasWangHashDouble(ulong key);
 double ThomasWangHashDouble(ulong key)
 {
@@ -134,52 +16,53 @@ double ThomasWangHashDouble(ulong key)
     return 5.42101086242752217E-20 * key;
 }
 
-__kernel void lisa(const int n, const int permutations, const unsigned long last_seed, __global double *values,  __global double *local_moran,  __global int *num_nbrs, __global int *nbr_idx, __global double *p) {
-    
+// Conditional permutation of AbstractCoordinator::CalcPseudoP_range() and
+// LisaCoordinator::ComputeLarger() (univariate, row-standardized weights, no
+// undefined values), with the random sequence of observation i starting at
+// last_seed + i.
+// num_nbrs[i] is the number of neighbors to permute, self excluded; it is -1 if
+// observation i has itself as its only neighbor: no permutation test for i, but
+// i is still drawn into permutations (the CPU tests w[newRandom].Size() > 0).
+// MAX_NBRS is defined by the host: at least the largest number of neighbors.
+__kernel void lisa(const int n, const int permutations, const unsigned long last_seed, __global double *values,  __global double *local_moran,  __global int *num_nbrs, __global double *p) {
+
     // Get the index of the current element
-    size_t i = get_global_id(0);
+    int i = get_global_id(0);
 
     if (i >= n) {
         return;
     }
-   
-    size_t j = 0;
-    size_t seed_start = i + last_seed;
-    
-    size_t numNeighbors = num_nbrs[i];
-    if (numNeighbors == 0) {
+
+    int numNeighbors = num_nbrs[i];
+    if (numNeighbors <= 0) {
+        // isolate: don't do permutation, leave p[i] as it was passed in
         return;
     }
-    
-    size_t nbr_start = 0;
-    
-    for (j=0; j <i; j++) {
-        nbr_start += num_nbrs[j];
-    }
-    
-    size_t max_rand = n-1;
-    int newRandom;
 
-    size_t perm=0;
-    size_t rand = 0;
+    ulong seed_start = i + last_seed;
+    int max_rand = n-1;
 
+    int j, perm, rand, newRandom;
     bool is_valid;
     double rng_val;
-    double permutedLag =0;
-    double localMoranPermuted=0;
-    size_t countLarger = 0;
+    double permutedLag;
+    double localMoranPermuted;
+    int countLarger = 0;
 
-    size_t rnd_numbers[123]; // 1234 can be replaced with max #nbr
+    // observations drawn in the current permutation, in draw order
+    int rnd_numbers[MAX_NBRS];
 
     for (perm=0; perm<permutations; perm++ ) {
         rand=0;
-        permutedLag =0;
         while (rand < numNeighbors) {
-            is_valid = true;
+            // computing 'perfect' permutation of given size
             rng_val = ThomasWangHashDouble(seed_start++) * max_rand;
-            newRandom = (int)rng_val;
+            // round is needed to fix issue
+            // https://github.com/GeoDaCenter/geoda/issues/488
+            newRandom = (int)(rng_val<0.0?ceil(rng_val - 0.5):floor(rng_val + 0.5));
 
-            if (newRandom != i ) {
+            if (newRandom != i && num_nbrs[newRandom] != 0) {
+                is_valid = true;
                 for (j=0; j<rand; j++) {
                     if (newRandom == rnd_numbers[j]) {
                         is_valid = false;
@@ -187,25 +70,29 @@ __kernel void lisa(const int n, const int permutations, const unsigned long last
                     }
                 }
                 if (is_valid) {
-                    permutedLag += values[newRandom];
                     rnd_numbers[rand] = newRandom;
                     rand++;
                 }
             }
 
         }
+
+        permutedLag = 0;
+        for (j=numNeighbors-1; j>=0; j--) { // GeoDaSet::Pop() order
+            permutedLag += values[rnd_numbers[j]];
+        }
         permutedLag /= numNeighbors;
         localMoranPermuted = permutedLag * values[i];
-        if (localMoranPermuted > local_moran[i]) {
+        if (localMoranPermuted >= local_moran[i]) {
             countLarger++;
         }
     }
-    
+
     // pick the smallest
     if (permutations-countLarger <= countLarger) {
         countLarger = permutations-countLarger;
     }
-    
+
     double sigLocal = (countLarger+1.0)/(permutations+1);
     p[i] = sigLocal;
 }

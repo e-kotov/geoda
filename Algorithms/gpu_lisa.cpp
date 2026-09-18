@@ -5,7 +5,6 @@
 #include <sstream>
 #include <math.h>
 #include <stdlib.h>
-#include <boost/algorithm/string/replace.hpp>
 #include "../ShapeOperations/GalWeight.h"
 #ifdef __linux__
 // do nothing; we got opencl sdk issue on centos
@@ -32,51 +31,66 @@ bool gpu_localjoincount(const char* cl_path, int rows, int permutations, unsigne
 
 using namespace std;
 
-char *replace_str(char *str, char *orig, const char *rep, int start)
+// Number of neighbors to permute for each observation, self excluded, as in
+// CalcPseudoP_range(); -1 marks an observation that has only itself as neighbor: no
+// permutation test for it, but it is still drawn into permutations of other
+// observations (the Local Moran code tests w[newRandom].Size() > 0).
+// Returns false if there are not enough observations to draw from, in which case the
+// permutation would never end.
+static bool prepare_num_nbrs(int rows, GalElement* w, bool skip_isolates, int* num_nbrs, int& max_n_nbrs)
 {
-    static char temp[4096];
-    static char buffer[4096];
-    char *p;
-    
-    strcpy(temp, str + start);
-    
-    if(!(p = strstr(temp, orig)))  // Is 'orig' even in 'temp'?
-        return temp;
-    
-    strncpy(buffer, temp, p-temp); // Copy characters from 'temp' start to 'orig' str
-    buffer[p-temp] = '\0';
-    
-    sprintf(buffer + (p - temp), "%s%s", rep, p + strlen(orig));
-    sprintf(str + start, "%s", buffer);
-    
-    return str;
+    int candidates = 0;
+    max_n_nbrs = 0;
+    for (int i=0; i<rows; i++) {
+        int nnbrs = (int)w[i].Size();
+        if (nnbrs > 0 || !skip_isolates) candidates++;
+        if (w[i].Check(i)) {
+            nnbrs -= 1; // exclude self from neighbors
+        }
+        num_nbrs[i] = (skip_isolates && nnbrs == 0 && w[i].Size() > 0) ? -1 : nnbrs;
+        if (nnbrs > max_n_nbrs) max_n_nbrs = nnbrs;
+    }
+    return max_n_nbrs < candidates;
+}
+
+// Size of the kernel's array of drawn observations: the largest number of neighbors,
+// rounded up to a power of two (which also limits recompilations)
+static int nbrs_buf_size(int max_n_nbrs)
+{
+    int buf_size = 64;
+    while (buf_size < max_n_nbrs) buf_size *= 2;
+    return buf_size;
+}
+
+static std::string build_options(int max_n_nbrs)
+{
+    std::ostringstream options;
+    options << "-D MAX_NBRS=" << nbrs_buf_size(max_n_nbrs);
+    return options.str();
+}
+
+// Work group size: each work item has its own array of drawn observations in private
+// memory, so a work group of the usual size can need more of it than a device has
+static size_t work_group_size(int max_n_nbrs)
+{
+    size_t local_item_size = 64;
+    while (local_item_size > 1 &&
+           local_item_size * sizeof(cl_int) * nbrs_buf_size(max_n_nbrs) > 65536) {
+        local_item_size /= 2;
+    }
+    return local_item_size;
 }
 
 bool gpu_lisa(const char* cl_path, int rows, int permutations, unsigned long long last_seed_used, double* values, double* local_moran, GalElement* w, double* p)
 {
+    if (rows <= 0) return false;
+
     int max_n_nbrs = 0;
     int* num_nbrs = new int[rows];
-    int total_nbrs = 0;
     
-    for (size_t i=0; i<rows; i++) {
-        long nnbrs = w[i].Size();
-        if (nnbrs > max_n_nbrs) {
-            max_n_nbrs = nnbrs;
-        }
-        num_nbrs[i] = nnbrs;
-        total_nbrs += nnbrs;
-    }
-    
-    int* nbr_idx = new int[total_nbrs];
-    size_t idx = 0;
-    
-    for (size_t i=0; i<rows; i++) {
-        long nnbrs = w[i].Size();
-        for (size_t j=0; j<nnbrs; j++) {
-            if (idx < total_nbrs) {
-                nbr_idx[idx++] = w[i][j];
-            }
-        }
+    if (!prepare_num_nbrs(rows, w, true, num_nbrs, max_n_nbrs)) {
+        delete[] num_nbrs;
+        return false;
     }
     
     // Load the kernel source code into the array source_str
@@ -84,12 +98,6 @@ bool gpu_lisa(const char* cl_path, int rows, int permutations, unsigned long lon
     std::stringstream buffer;
     buffer << t.rdbuf();
     std::string src_code(buffer.str());
-
-    // replace 123 with max_n_nbrs
-    //if (max_n_nbrs * 2 < 500) max_n_nbrs = 500;
-    std::ostringstream s;
-    s << max_n_nbrs * 2;
-    boost::replace_all(src_code, "123", s.str());
 
     char *source_str = strdup(src_code.c_str());
     size_t source_size = strlen(source_str);
@@ -101,7 +109,6 @@ bool gpu_lisa(const char* cl_path, int rows, int permutations, unsigned long lon
     cl_int ret = clGetPlatformIDs(1, &platform_id, &ret_num_platforms);
     if (ret != CL_SUCCESS) {
         delete[] num_nbrs;
-        delete[] nbr_idx;
         return false;
     }
     
@@ -112,13 +119,11 @@ bool gpu_lisa(const char* cl_path, int rows, int permutations, unsigned long lon
     if (ret != CL_SUCCESS) {
         delete[] devices;
         delete[] num_nbrs;
-        delete[] nbr_idx;
         return false;
     }
 	if (ret_num_devices==0) {
         delete[] devices;
         delete[] num_nbrs;
-        delete[] nbr_idx;
 		return false;
 	}
     cl_device_id device_id = devices[0];
@@ -140,9 +145,7 @@ bool gpu_lisa(const char* cl_path, int rows, int permutations, unsigned long lon
                                       sizeof(double)*rows, NULL, &ret);
     cl_mem c_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY,
                                       sizeof(int)*rows, NULL, &ret);
-    cl_mem d_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY,
-                                      sizeof(int)*total_nbrs, NULL, &ret);
-    cl_mem p_mem_obj = clCreateBuffer(context, CL_MEM_WRITE_ONLY,
+    cl_mem p_mem_obj = clCreateBuffer(context, CL_MEM_READ_WRITE,
                                       sizeof(double)*rows, NULL, &ret);
     
     // Copy the lists A and B to their respective memory buffers
@@ -152,18 +155,15 @@ bool gpu_lisa(const char* cl_path, int rows, int permutations, unsigned long lon
                                local_moran, 0, NULL, NULL);
     ret = clEnqueueWriteBuffer(command_queue, c_mem_obj, CL_TRUE, 0, sizeof(int)*rows,
                                num_nbrs, 0, NULL, NULL);
-    ret = clEnqueueWriteBuffer(command_queue, d_mem_obj, CL_TRUE, 0, sizeof(int)*total_nbrs,
-                               nbr_idx, 0, NULL, NULL);
+    // p is copied in: the kernel leaves the p-value of an isolate untouched
     ret = clEnqueueWriteBuffer(command_queue, p_mem_obj, CL_TRUE, 0, sizeof(double)*rows,
                                p, 0, NULL, NULL);
     if (ret != CL_SUCCESS) {
         delete[] num_nbrs;
-        delete[] nbr_idx;
         
         ret = clReleaseMemObject(a_mem_obj);
         ret = clReleaseMemObject(b_mem_obj);
         ret = clReleaseMemObject(c_mem_obj);
-        ret = clReleaseMemObject(d_mem_obj);
         ret = clReleaseMemObject(p_mem_obj);
         
 		return false;
@@ -172,7 +172,7 @@ bool gpu_lisa(const char* cl_path, int rows, int permutations, unsigned long lon
     cl_program program = clCreateProgramWithSource(context, 1, (const char **)&source_str, (const size_t *)&source_size, &ret);
     
     // Build the program
-    ret = clBuildProgram(program, 1, &device_id, NULL, NULL, NULL);
+    ret = clBuildProgram(program, 1, &device_id, build_options(max_n_nbrs).c_str(), NULL, NULL);
     
 	if (ret != CL_SUCCESS) {
         std::cout<<"Program Build failed\n";
@@ -182,13 +182,11 @@ bool gpu_lisa(const char* cl_path, int rows, int permutations, unsigned long lon
         std::cout<<"--- Build log ---\n "<<buffer<<endl;
         
         delete[] num_nbrs;
-        delete[] nbr_idx;
         
         ret = clReleaseProgram(program);
         ret = clReleaseMemObject(a_mem_obj);
         ret = clReleaseMemObject(b_mem_obj);
         ret = clReleaseMemObject(c_mem_obj);
-        ret = clReleaseMemObject(d_mem_obj);
         ret = clReleaseMemObject(p_mem_obj);
         
 		return false;
@@ -204,33 +202,35 @@ bool gpu_lisa(const char* cl_path, int rows, int permutations, unsigned long lon
     ret = clSetKernelArg(kernel, 3, sizeof(cl_mem), (void *)&a_mem_obj);
     ret = clSetKernelArg(kernel, 4, sizeof(cl_mem), (void *)&b_mem_obj);
     ret = clSetKernelArg(kernel, 5, sizeof(cl_mem), (void *)&c_mem_obj);
-    ret = clSetKernelArg(kernel, 6, sizeof(cl_mem), (void *)&d_mem_obj);
-    ret = clSetKernelArg(kernel, 7, sizeof(cl_mem), (void *)&p_mem_obj);
+    ret = clSetKernelArg(kernel, 6, sizeof(cl_mem), (void *)&p_mem_obj);
     
 	if (ret != CL_SUCCESS) {
         delete[] num_nbrs;
-        delete[] nbr_idx;
         
         ret = clReleaseKernel(kernel);
         ret = clReleaseProgram(program);
         ret = clReleaseMemObject(a_mem_obj);
         ret = clReleaseMemObject(b_mem_obj);
         ret = clReleaseMemObject(c_mem_obj);
-        ret = clReleaseMemObject(d_mem_obj);
         ret = clReleaseMemObject(p_mem_obj);
         
 		return false;
 	}
 
     // Execute the OpenCL kernel on the list
-    size_t global_item_size = 256 * ceil(rows/256.0); // Process the entire lists
-    size_t local_item_size = 256; // Process in groups of 64
+    size_t local_item_size = work_group_size(max_n_nbrs);
+    size_t global_item_size = local_item_size * ceil(rows/(double)local_item_size);
     ret = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL,
                                  &global_item_size, &local_item_size, 0, NULL, NULL);
     
     // Read the memory buffer C on the device to the local variable C
-    ret = clEnqueueReadBuffer(command_queue, p_mem_obj, CL_TRUE, 0,
-                              sizeof(double) * rows, p, 0, NULL, NULL);
+    if (ret == CL_SUCCESS) {
+        ret = clEnqueueReadBuffer(command_queue, p_mem_obj, CL_TRUE, 0,
+                                  sizeof(double) * rows, p, 0, NULL, NULL);
+    }
+    // a kernel that did not run must not be reported as a success: otherwise the
+    // caller uses the p-values it passed in
+    bool kernel_ok = ret == CL_SUCCESS;
     
     // Display the result to the screen
     //for(size_t i = 0; i < 20; i++)
@@ -244,48 +244,32 @@ bool gpu_lisa(const char* cl_path, int rows, int permutations, unsigned long lon
     ret = clReleaseMemObject(a_mem_obj);
     ret = clReleaseMemObject(b_mem_obj);
     ret = clReleaseMemObject(c_mem_obj);
-    ret = clReleaseMemObject(d_mem_obj);
     ret = clReleaseMemObject(p_mem_obj);
     //ret = clReleaseCommandQueue(command_queue);
     ret = clReleaseContext(context);
 
 	if (ret != CL_SUCCESS) {
         delete[] num_nbrs;
-        delete[] nbr_idx;
 		return false;
 	}
 
     delete[] num_nbrs;
-    delete[] nbr_idx;
     delete[] devices;
-	return true;
+	return kernel_ok;
 }
 
 bool gpu_localjoincount(const char* cl_path, int rows, int permutations, unsigned long long last_seed_used, int num_vars, int* zz, double* local_jc, GalElement* w, double* p)
 {
+    if (rows <= 0) return false;
+
+    // num_vars is not passed to the kernel: the caller has combined the variables into zz
     int max_n_nbrs = 0;
-    unsigned short* num_nbrs = new unsigned short[rows];
-    int total_nbrs = 0;
+    int* num_nbrs = new int[rows];
     
-    for (size_t i=0; i<rows; i++) {
-        long nnbrs = w[i].Size();
-        if (nnbrs > max_n_nbrs) {
-            max_n_nbrs = nnbrs;
-        }
-        num_nbrs[i] = nnbrs;
-        total_nbrs += nnbrs;
-    }
-    
-    unsigned short* nbr_idx = new unsigned short[total_nbrs];
-    size_t idx = 0;
-    
-    for (size_t i=0; i<rows; i++) {
-        long nnbrs = w[i].Size();
-        for (size_t j=0; j<nnbrs; j++) {
-            if (idx < total_nbrs) {
-                nbr_idx[idx++] = w[i][j];
-            }
-        }
+    // any observation can be drawn into a permutation, isolates included
+    if (!prepare_num_nbrs(rows, w, false, num_nbrs, max_n_nbrs)) {
+        delete[] num_nbrs;
+        return false;
     }
     
     // Load the kernel source code into the array source_str
@@ -295,7 +279,6 @@ bool gpu_localjoincount(const char* cl_path, int rows, int permutations, unsigne
     
     fp = fopen(cl_path, "r");
     if (!fp) {
-        delete[] nbr_idx;
         delete[] num_nbrs;
         fprintf(stderr, "Failed to load kernel.\n");
         return false;
@@ -304,25 +287,6 @@ bool gpu_localjoincount(const char* cl_path, int rows, int permutations, unsigne
     source_size = fread( source_str, 1, MAX_SOURCE_SIZE, fp);
     fclose( fp );
     
-    // replace 123 with max_n_nbrs
-    char msg[25];
-#ifdef __WIN32__
-    _snprintf(msg, sizeof(msg), "%d", max_n_nbrs);
-#else
-    snprintf(msg, sizeof(msg), "%d", max_n_nbrs);
-#endif
-    replace_str(source_str, "888", msg, 0);
-    
-#ifdef __WIN32__
-    _snprintf(msg, sizeof(msg), "%d", rows);
-#else
-    snprintf(msg, sizeof(msg), "%d", rows);
-#endif
-    replace_str(source_str, "999", msg, 0);
-    replace_str(source_str, "999", msg, 0);
-    
-    source_size = strlen(source_str);
-    
     // Get platform and device information
     cl_platform_id platform_id = NULL;
     cl_uint ret_num_devices;
@@ -330,7 +294,6 @@ bool gpu_localjoincount(const char* cl_path, int rows, int permutations, unsigne
     cl_int ret = clGetPlatformIDs(1, &platform_id, &ret_num_platforms);
     if (ret != CL_SUCCESS) {
         delete[] num_nbrs;
-        delete[] nbr_idx;
         return false;
     }
     
@@ -341,13 +304,11 @@ bool gpu_localjoincount(const char* cl_path, int rows, int permutations, unsigne
     if (ret != CL_SUCCESS) {
         if (devices) delete[] devices;
         if(num_nbrs) delete[] num_nbrs;
-        if(nbr_idx) delete[] nbr_idx;
         return false;
     }
     if (ret_num_devices==0) {
         if (devices) delete[] devices;
         if(num_nbrs) delete[] num_nbrs;
-        if(nbr_idx) delete[] nbr_idx;
         return false;
     }
     cl_device_id device_id = devices[0];
@@ -363,41 +324,24 @@ bool gpu_localjoincount(const char* cl_path, int rows, int permutations, unsigne
     cl_command_queue command_queue = clCreateCommandQueue(context, device_id, 0, &ret);
     
     
-    // prepare data
-    unsigned short* v_zz  = new unsigned short[rows];
-    unsigned short* v_local_jc = new unsigned short[rows];
-    float* v_p = new float[rows];
-    
-    for (size_t i=0; i<rows; i++) {
-        v_zz[i] = zz[i];
-        v_local_jc[i] = local_jc[i];
-        v_p[i] = 0.0f;
-    }
-    
     // Create memory buffers on the device for each vector
     cl_mem a_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY,
-                                      sizeof(unsigned short)*rows, NULL, &ret);
+                                      sizeof(int)*rows, NULL, &ret);
     cl_mem b_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY,
-                                      sizeof(unsigned short)*rows, NULL, &ret);
+                                      sizeof(double)*rows, NULL, &ret);
     cl_mem c_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY,
-                                      sizeof(unsigned short)*rows, NULL, &ret);
-    cl_mem d_mem_obj = clCreateBuffer(context, CL_MEM_READ_ONLY,
-                                      sizeof(unsigned short)*total_nbrs, NULL, &ret);
-    cl_mem p_mem_obj = clCreateBuffer(context, CL_MEM_WRITE_ONLY,
-                                      sizeof(float)*rows, NULL, &ret);
+                                      sizeof(int)*rows, NULL, &ret);
+    cl_mem p_mem_obj = clCreateBuffer(context, CL_MEM_READ_WRITE,
+                                      sizeof(double)*rows, NULL, &ret);
     
     // Copy the lists A and B to their respective memory buffers
-    ret = clEnqueueWriteBuffer(command_queue, a_mem_obj, CL_TRUE, 0, sizeof(unsigned short)*rows, v_zz, 0, NULL, NULL);
-    ret = clEnqueueWriteBuffer(command_queue, b_mem_obj, CL_TRUE, 0, sizeof(unsigned short)*rows, v_local_jc, 0, NULL, NULL);
-    ret = clEnqueueWriteBuffer(command_queue, c_mem_obj, CL_TRUE, 0, sizeof(unsigned short)*rows, num_nbrs, 0, NULL, NULL);
-    ret = clEnqueueWriteBuffer(command_queue, d_mem_obj, CL_TRUE, 0, sizeof(unsigned short)*total_nbrs, nbr_idx, 0, NULL, NULL);
-    ret = clEnqueueWriteBuffer(command_queue, p_mem_obj, CL_TRUE, 0, sizeof(float)*rows, v_p, 0, NULL, NULL);
+    ret = clEnqueueWriteBuffer(command_queue, a_mem_obj, CL_TRUE, 0, sizeof(int)*rows, zz, 0, NULL, NULL);
+    ret = clEnqueueWriteBuffer(command_queue, b_mem_obj, CL_TRUE, 0, sizeof(double)*rows, local_jc, 0, NULL, NULL);
+    ret = clEnqueueWriteBuffer(command_queue, c_mem_obj, CL_TRUE, 0, sizeof(int)*rows, num_nbrs, 0, NULL, NULL);
+    // p is copied in: the kernel leaves the p-value of an isolate untouched
+    ret = clEnqueueWriteBuffer(command_queue, p_mem_obj, CL_TRUE, 0, sizeof(double)*rows, p, 0, NULL, NULL);
     if (ret != CL_SUCCESS) {
-        if(v_zz) delete[] v_zz;
-        if(v_local_jc) delete[] v_local_jc;
-        if(v_p) delete[] v_p;
         if(num_nbrs) delete[] num_nbrs;
-        if(nbr_idx) delete[] nbr_idx;
         return false;
     }
     // Create a program from the kernel source
@@ -405,7 +349,7 @@ bool gpu_localjoincount(const char* cl_path, int rows, int permutations, unsigne
                                                    (const char **)&source_str, (const size_t *)&source_size, &ret);
     
     // Build the program
-    ret = clBuildProgram(program, 1, &device_id, NULL, NULL, NULL);
+    ret = clBuildProgram(program, 1, &device_id, build_options(max_n_nbrs).c_str(), NULL, NULL);
     
     if (ret != CL_SUCCESS) {
         std::cout<<"Program Build failed\n";
@@ -414,17 +358,12 @@ bool gpu_localjoincount(const char* cl_path, int rows, int permutations, unsigne
         clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, sizeof(buffer), buffer, &length);
         std::cout<<"--- Build log ---\n "<<buffer<<endl;
         
-        if(v_zz) delete[] v_zz;
-        if(v_local_jc) delete[] v_local_jc;
-        if(v_p) delete[] v_p;
         if(num_nbrs) delete[] num_nbrs;
-        if(nbr_idx) delete[] nbr_idx;
         
         ret = clReleaseProgram(program);
         ret = clReleaseMemObject(a_mem_obj);
         ret = clReleaseMemObject(b_mem_obj);
         ret = clReleaseMemObject(c_mem_obj);
-        ret = clReleaseMemObject(d_mem_obj);
         ret = clReleaseMemObject(p_mem_obj);
         
         return false;
@@ -437,47 +376,42 @@ bool gpu_localjoincount(const char* cl_path, int rows, int permutations, unsigne
     ret = clSetKernelArg(kernel, 0, sizeof(cl_int), (void *)&rows);
     ret = clSetKernelArg(kernel, 1, sizeof(cl_int), (void *)&permutations);
     ret = clSetKernelArg(kernel, 2, sizeof(cl_ulong), (void *)&last_seed_used);
-    ret = clSetKernelArg(kernel, 3, sizeof(cl_int), (void *)&num_vars);
-    ret = clSetKernelArg(kernel, 4, sizeof(cl_mem), (void *)&a_mem_obj);
-    ret = clSetKernelArg(kernel, 5, sizeof(cl_mem), (void *)&b_mem_obj);
-    ret = clSetKernelArg(kernel, 6, sizeof(cl_mem), (void *)&c_mem_obj);
-    ret = clSetKernelArg(kernel, 7, sizeof(cl_mem), (void *)&d_mem_obj);
-    ret = clSetKernelArg(kernel, 8, sizeof(cl_mem), (void *)&p_mem_obj);
+    ret = clSetKernelArg(kernel, 3, sizeof(cl_mem), (void *)&a_mem_obj);
+    ret = clSetKernelArg(kernel, 4, sizeof(cl_mem), (void *)&b_mem_obj);
+    ret = clSetKernelArg(kernel, 5, sizeof(cl_mem), (void *)&c_mem_obj);
+    ret = clSetKernelArg(kernel, 6, sizeof(cl_mem), (void *)&p_mem_obj);
     
     if (ret != CL_SUCCESS) {
-        if(v_zz) delete[] v_zz;
-        if(v_local_jc) delete[] v_local_jc;
-        if(v_p) delete[] v_p;
         if(num_nbrs) delete[] num_nbrs;
-        if(nbr_idx) delete[] nbr_idx;
         
         ret = clReleaseKernel(kernel);
         ret = clReleaseProgram(program);
         ret = clReleaseMemObject(a_mem_obj);
         ret = clReleaseMemObject(b_mem_obj);
         ret = clReleaseMemObject(c_mem_obj);
-        ret = clReleaseMemObject(d_mem_obj);
         ret = clReleaseMemObject(p_mem_obj);
         
         return false;
     }
     
     // Execute the OpenCL kernel on the list
-    size_t global_item_size = 256 * ceil(rows/256.0); // Process the entire lists
-    size_t local_item_size = 256; // Process in groups of 64
+    size_t local_item_size = work_group_size(max_n_nbrs);
+    size_t global_item_size = local_item_size * ceil(rows/(double)local_item_size);
     ret = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, &global_item_size, &local_item_size, 0, NULL, NULL);
     
     // Read the memory buffer C on the device to the local variable C
-    ret = clEnqueueReadBuffer(command_queue, p_mem_obj, CL_TRUE, 0, sizeof(float) * rows, v_p, 0, NULL, NULL);
+    if (ret == CL_SUCCESS) {
+        ret = clEnqueueReadBuffer(command_queue, p_mem_obj, CL_TRUE, 0, sizeof(double) * rows, p, 0, NULL, NULL);
+    }
+    // a kernel that did not run must not be reported as a success: otherwise the
+    // caller uses the p-values it passed in
+    bool kernel_ok = ret == CL_SUCCESS;
     
     //Display the result to the screen
     //for(size_t i = 0; i < 20; i++) {
     //    printf("%f, %f, %f\n", values[i], values[1*rows + i], p[i]);
     //}
-    for (size_t i=0; i<rows; i++) {
-        p[i] = v_p[i];
-    }
-    
+
     // Clean up
     ret = clFlush(command_queue);
     ret = clFinish(command_queue);
@@ -486,26 +420,17 @@ bool gpu_localjoincount(const char* cl_path, int rows, int permutations, unsigne
     ret = clReleaseMemObject(a_mem_obj);
     ret = clReleaseMemObject(b_mem_obj);
     ret = clReleaseMemObject(c_mem_obj);
-    ret = clReleaseMemObject(d_mem_obj);
     ret = clReleaseMemObject(p_mem_obj);
     ret = clReleaseCommandQueue(command_queue);
     ret = clReleaseContext(context);
     
     if (ret != CL_SUCCESS) {
-        if(v_zz) delete[] v_zz;
-        if(v_local_jc) delete[] v_local_jc;
-        if(v_p) delete[] v_p;
         if(num_nbrs) delete[] num_nbrs;
-        if(nbr_idx) delete[] nbr_idx;
         return false;
     }
     
-    if(v_zz) delete[] v_zz;
-    if(v_local_jc) delete[] v_local_jc;
-    if(v_p) delete[] v_p;
     if(num_nbrs) delete[] num_nbrs;
-    if(nbr_idx) delete[] nbr_idx;
     
-    return true;
+    return kernel_ok;
 }
 #endif
