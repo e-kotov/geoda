@@ -57,7 +57,7 @@ static void cpu_reference(bool is_jc, bool per_obs_seed, int n, int permutations
 {
     int max_rand = n - 1;
     uint64_t seed_start = seed;
-    const double tie_tol = 1e-13; // relative to the sum of absolute values, see metal_lisa()
+    const double tie_tol = ldexp(1.0, -52); // times (neighbors + 4) times sum of absolute values, see lisa_kernel.metal
     std::vector<bool> drawn(n, false);
     std::vector<int> perm_nbrs;
 
@@ -93,7 +93,7 @@ static void cpu_reference(bool is_jc, bool per_obs_seed, int n, int permutations
                 // same test with ties decided exactly
                 // (difference of the sums of neighbors is a roundoff error, see metal_lisa())
                 double obs_sum = x[i] == 0 ? 0 : local_sa[i] * num_nbrs / x[i];
-                bool tie = x[i] == 0 || fabs(lag - obs_sum) <= tie_tol * (lag_abs + fabs(obs_sum));
+                bool tie = x[i] == 0 || fabs(lag - obs_sum) <= tie_tol * (num_nbrs + 4) * (lag_abs + fabs(obs_sum));
                 if (tie) ties++;
                 if (tie || permuted > local_sa[i]) count_larger_no_ties++;
             }
@@ -190,6 +190,24 @@ static TestCase dense(int n, int k)
     return tc;
 }
 
+// few distinct values that are not representable once standardized, many neighbors:
+// almost every permutation of some observations ties with the observed value
+static TestCase tied_dense(int n, int k)
+{
+    TestCase tc;
+    tc.name = "tied values, 150 neighbors, standardized";
+    tc.w.resize(n);
+    for (int i = 0; i < n; i++) {
+        double v = floor(ThomasWangHashDouble(i + 5000) * 3);
+        tc.x.push_back(v == 2 ? 0.1 : v);
+        tc.zz.push_back(v == 1);
+        tc.w[i].SetSizeNbrs(k);
+        for (int j = 0; j < k; j++) tc.w[i].SetNbr(j, (i + 1 + 7 * j) % n);
+    }
+    standardize(tc.x);
+    return tc;
+}
+
 static int failures = 0;
 
 static void check(bool ok, const char* what)
@@ -268,6 +286,8 @@ int main(int argc, char* argv[])
 
     TestCase d = dense(200, 100);
     run(d, lisa_path, jc_path, 999);
+    TestCase td = tied_dense(1200, 150);
+    run(td, lisa_path, jc_path, 999);
 
     // an isolate leaves too few observations to draw 3 neighbors from: the CPU code
     // would never finish, the GPU code must refuse

@@ -15,23 +15,48 @@ inline int ThomasWangHashIndex(ulong key, ulong max_rand)
     return (int)(mulhi(key, max_rand) + ((key * max_rand) >> 63));
 }
 
-// There is no fp64 on Apple GPUs: a double x is passed as the pair of floats
-// (x, x_lo) with x + x_lo == x up to 48 bits, and the permuted lag is accumulated
-// as such pair (requires compiling without fast math).
+// There is no fp64 on Apple GPUs: the host passes each double as a 128 bit fixed point
+// number (two ulong: low, high; two's complement), so sums of neighbors are exact.
 // local_moran_permuted >= local_moran (as in LisaCoordinator::ComputeLarger) is tested
-// as sum of permuted neighbors vs lag_sum = the observed sum of neighbors; differences
-// below tie_tol relative to the sum of absolute values are ties.
+// as sum of permuted neighbors vs lag_sum = the observed sum of neighbors. The CPU's
+// double arithmetic errs by up to 2^-53 of the partial sums for each of its k additions
+// (plus a few operations for the observed value): differences up to
+// (k + 4) 2^-52 (sum of absolute values) cannot be told from ties by the CPU and are ties here.
+struct Fixed128 {
+    ulong lo;
+    ulong hi;
+};
+
+inline Fixed128 add128(Fixed128 a, Fixed128 b)
+{
+    Fixed128 r;
+    r.lo = a.lo + b.lo;
+    r.hi = a.hi + b.hi + (r.lo < a.lo ? 1 : 0);
+    return r;
+}
+
+inline Fixed128 neg128(Fixed128 a)
+{
+    Fixed128 r;
+    r.lo = ~a.lo + 1;
+    r.hi = ~a.hi + (r.lo == 0 ? 1 : 0);
+    return r;
+}
+
+inline Fixed128 abs128(Fixed128 a)
+{
+    return ((long)a.hi < 0) ? neg128(a) : a;
+}
+
 kernel void lisa_metal(
     constant int &n                       [[buffer(0)]],
     constant int &permutations            [[buffer(1)]],
     constant ulong &last_seed             [[buffer(2)]],
     device const int *num_nbrs            [[buffer(3)]],
-    device const float *values            [[buffer(4)]],
-    device const float *values_lo         [[buffer(5)]],
-    device const float *lag_sum           [[buffer(6)]],
-    device const float *lag_sum_lo        [[buffer(7)]],
-    constant float &tie_tol               [[buffer(8)]],
-    device int *count_larger              [[buffer(9)]],
+    device const Fixed128 *values         [[buffer(4)]],
+    device const Fixed128 *lag_sum        [[buffer(5)]],
+    device const int *value_sign          [[buffer(6)]],
+    device int *count_larger              [[buffer(7)]],
     uint i                                [[thread_position_in_grid]])
 {
     if (i >= (uint)n) {
@@ -62,7 +87,7 @@ kernel void lisa_metal(
 
     for (int perm = 0; perm < permutations; perm++) {
         int rand = 0;
-        float permutedLag = 0.0f, permutedLag_lo = 0.0f, sumAbs = 0.0f;
+        Fixed128 permutedLag = {0, 0}, sumAbs = {0, 0};
 
         while (rand < numNeighbors) {
             int newRandom = ThomasWangHashIndex(seed_start++, max_rand);
@@ -84,13 +109,8 @@ kernel void lisa_metal(
                 }
 #endif
                 if (is_valid) {
-                    // Knuth's TwoSum: s + err == permutedLag + values[newRandom] exactly
-                    float s = permutedLag + values[newRandom];
-                    float t = s - permutedLag;
-                    float err = (permutedLag - (s - t)) + (values[newRandom] - t);
-                    permutedLag = s;
-                    permutedLag_lo += err + values_lo[newRandom];
-                    sumAbs += fabs(values[newRandom]);
+                    permutedLag = add128(permutedLag, values[newRandom]);
+                    sumAbs = add128(sumAbs, abs128(values[newRandom]));
 #if MAX_NBRS > 128
                     drawn[slot] = newRandom;
                     used_slots[rand] = slot;
@@ -105,9 +125,17 @@ kernel void lisa_metal(
         for (int j = 0; j < numNeighbors; j++) drawn[used_slots[j]] = -1;
 #endif
 
-        float diff = (permutedLag - lag_sum[i]) + (permutedLag_lo - lag_sum_lo[i]);
-        float tol = tie_tol * (sumAbs + fabs(lag_sum[i])); // roundoff is relative to the summands
-        if ((values[i] > 0 && diff >= -tol) || (values[i] < 0 && diff <= tol) || values[i] == 0) {
+        Fixed128 diff = add128(permutedLag, neg128(lag_sum[i]));
+        // tol = (k + 4) * 2^-52 * (sumAbs + |lag_sum|)
+        Fixed128 u = add128(sumAbs, abs128(lag_sum[i]));
+        ulong c = (ulong)(numNeighbors + 4);
+        Fixed128 v = {(u.lo >> 52) | (u.hi << 12), u.hi >> 52};
+        Fixed128 tol = {v.lo * c, v.hi * c + mulhi(v.lo, c)};
+        // diff >= -tol, or diff <= tol for negative values[i]
+        bool larger = (value_sign[i] > 0 && (long)add128(diff, tol).hi >= 0) ||
+                      (value_sign[i] < 0 && (long)add128(neg128(diff), tol).hi >= 0) ||
+                      value_sign[i] == 0;
+        if (larger) {
             countLarger++;
         }
     }

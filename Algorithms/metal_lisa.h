@@ -9,7 +9,7 @@ class GalElement;
 // deprecated on macOS and its fp64 kernels do not run on Apple Silicon GPUs).
 // Conditional permutation follows AbstractCoordinator::CalcPseudoP_range(),
 // with the random sequence of observation i starting at last_seed_used + i.
-// Values are processed in single precision. Return false if Metal can't be used.
+// Return false if Metal can't be used.
 
 bool is_metal_supported();
 

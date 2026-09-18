@@ -48,10 +48,6 @@ static id<MTLComputePipelineState> metal_pipeline(const char* metal_path, NSStri
     }
     MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
     options.preprocessorMacros = @{ @"MAX_NBRS" : @(max_nbrs) };
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    options.fastMathEnabled = NO; // the kernels rely on IEEE arithmetic
-#pragma clang diagnostic pop
     id<MTLLibrary> library = [metal_device() newLibraryWithSource:src options:options error:&error];
     id<MTLFunction> func = library ? [library newFunctionWithName:kernel_name] : nil;
     id<MTLComputePipelineState> pipeline = func ? [metal_device() newComputePipelineStateWithFunction:func error:&error] : nil;
@@ -63,6 +59,23 @@ static id<MTLComputePipelineState> metal_pipeline(const char* metal_path, NSStri
     }
     cache[key] = pipeline;
     return pipeline;
+}
+
+// 128 bit two's complement fixed point: x * 2^shift truncated to an integer, clamped to +-2^126
+struct Fixed128 {
+    uint64_t lo;
+    uint64_t hi;
+};
+
+static Fixed128 to_fixed128(double x, int shift)
+{
+    double scaled = ldexp(x, shift);
+    const double limit = ldexp(1.0, 126);
+    if (scaled > limit) scaled = limit;
+    if (scaled < -limit) scaled = -limit;
+    __int128 q = (__int128)scaled;
+    Fixed128 f = { (uint64_t)q, (uint64_t)(q >> 64) };
+    return f;
 }
 
 // Number of neighbors (excluding self) to permute for each observation, 0 for isolates,
@@ -150,36 +163,31 @@ bool metal_lisa(const char* metal_path, int rows, int permutations, unsigned lon
     std::vector<int> num_nbrs, count_larger;
     if (!metal_num_nbrs(rows, w, true, num_nbrs, max_nbrs)) return false;
 
-    // No fp64 on Apple GPUs: pass each double as a (high, low) pair of floats.
-    // permuted lag * values[i] >= local_moran[i] (row-standardized weights) is tested in
-    // the kernel as sum of permuted neighbors >=(<=) lag_sum[i] for positive (negative) values[i]
-    std::vector<float> val(rows), val_lo(rows), lag_sum(rows, 0), lag_sum_lo(rows, 0);
-    // values are scaled to [-1, 1] (the test is scale invariant): any magnitude fits a float
+    // No fp64 on Apple GPUs: doubles are passed as 128 bit fixed point numbers (exact sums).
+    // permuted lag * values[i] >= local_moran[i] (row-standardized weights) is tested in the
+    // kernel as sum of permuted neighbors >=(<=) lag_sum[i] for positive (negative) values[i]
     double max_abs = 0;
     for (int i = 0; i < rows; i++) {
+        if (!std::isfinite(values[i]) || !std::isfinite(local_moran[i])) return false;
         if (fabs(values[i]) > max_abs) max_abs = fabs(values[i]);
     }
-    if (max_abs == 0) max_abs = 1;
+    // values become integers below 2^110: sums of less than 2^17 of them fit
+    int exponent = 0;
+    frexp(max_abs, &exponent);
+    int shift = 110 - exponent;
+    std::vector<Fixed128> val(rows), lag_sum(rows);
+    std::vector<int> value_sign(rows);
     for (int i = 0; i < rows; i++) {
-        double v = values[i] / max_abs;
-        val[i] = (float)v;
-        val_lo[i] = (float)(v - val[i]);
-        if (values[i] != 0) {
-            double s = local_moran[i] * num_nbrs[i] / values[i] / max_abs;
-            lag_sum[i] = (float)s;
-            lag_sum_lo[i] = (float)(s - lag_sum[i]);
-        }
+        val[i] = to_fixed128(values[i], shift);
+        value_sign[i] = (values[i] > 0) - (values[i] < 0);
+        double s = values[i] != 0 ? local_moran[i] * num_nbrs[i] / values[i] : 0;
+        lag_sum[i] = to_fixed128(s, shift);
     }
-    // differences from the observed value below this (relative to the sum of absolute values)
-    // are roundoff errors, i.e. ties: float pairs carry 48 bits, 3.6e-15
-    float tie_tol = 1e-13f;
 
     std::vector<MetalInput> inputs;
-    inputs.push_back(MetalInput(val.data(), sizeof(float)*rows));
-    inputs.push_back(MetalInput(val_lo.data(), sizeof(float)*rows));
-    inputs.push_back(MetalInput(lag_sum.data(), sizeof(float)*rows));
-    inputs.push_back(MetalInput(lag_sum_lo.data(), sizeof(float)*rows));
-    inputs.push_back(MetalInput(&tie_tol, sizeof(float)));
+    inputs.push_back(MetalInput(val.data(), sizeof(Fixed128)*rows));
+    inputs.push_back(MetalInput(lag_sum.data(), sizeof(Fixed128)*rows));
+    inputs.push_back(MetalInput(value_sign.data(), sizeof(int)*rows));
     if (!metal_run(metal_path, @"lisa_metal", max_nbrs, rows, permutations, last_seed_used,
                    num_nbrs, inputs, count_larger)) return false;
 
