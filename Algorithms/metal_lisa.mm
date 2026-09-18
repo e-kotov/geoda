@@ -65,7 +65,8 @@ static id<MTLComputePipelineState> metal_pipeline(const char* metal_path, NSStri
     return pipeline;
 }
 
-// Number of neighbors (excluding self) to permute for each observation
+// Number of neighbors (excluding self) to permute for each observation, 0 for isolates,
+// -1 if the only neighbor is the observation itself
 static bool metal_num_nbrs(int rows, GalElement* w, bool skip_isolates, std::vector<int>& num_nbrs, int& max_nbrs)
 {
     int candidates = 0;
@@ -75,6 +76,8 @@ static bool metal_num_nbrs(int rows, GalElement* w, bool skip_isolates, std::vec
         num_nbrs[i] = (int)w[i].Size();
         if (num_nbrs[i] > 0 || !skip_isolates) candidates++;
         if (w[i].Check(i)) num_nbrs[i] -= 1;
+        // only neighbor is itself: no permutation test, but still drawn (CPU tests Size() > 0)
+        if (num_nbrs[i] == 0 && w[i].Size() > 0) num_nbrs[i] = -1;
         if (num_nbrs[i] > max_nbrs) max_nbrs = num_nbrs[i];
     }
     // not enough observations to draw from: the permutation would never end

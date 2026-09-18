@@ -30,7 +30,7 @@ kernel void localjc_metal(
     }
 
     int numNeighbors = num_nbrs[i];
-    if (local_jc[i] == 0 || numNeighbors == 0) {
+    if (local_jc[i] == 0 || numNeighbors <= 0) {
         count_larger[i] = -1; // no permutation test
         return;
     }

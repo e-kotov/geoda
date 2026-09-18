@@ -39,7 +39,7 @@ kernel void lisa_metal(
     }
 
     int numNeighbors = num_nbrs[i];
-    if (numNeighbors == 0) {
+    if (numNeighbors <= 0) {
         count_larger[i] = -1; // no permutation test
         return;
     }
@@ -67,7 +67,7 @@ kernel void lisa_metal(
         while (rand < numNeighbors) {
             int newRandom = ThomasWangHashIndex(seed_start++, max_rand);
 
-            if (newRandom != (int)i && num_nbrs[newRandom] > 0) {
+            if (newRandom != (int)i && num_nbrs[newRandom] != 0) {
 #if MAX_NBRS > 128
                 int slot = newRandom & (MAX_NBRS - 1);
                 while (drawn[slot] != -1 && drawn[slot] != newRandom) {
