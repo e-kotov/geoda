@@ -257,7 +257,9 @@ int main(int argc, char* argv[])
     const char* jc_path = (argc > 2) ? argv[2] : "Algorithms/localjc_kernel.metal";
 
     if (!is_metal_supported()) {
-        printf("[SKIP] No Metal device available.\n");
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        printf("[SKIP] No Apple Silicon Metal device available (default device: %s, Apple7 family: %d).\n",
+               dev ? [[dev name] UTF8String] : "none", dev ? (int)[dev supportsFamily:MTLGPUFamilyApple7] : 0);
         return 0;
     }
     TestCase g = sample_data("Guerry donatns, queen", guerry_n, guerry_x, guerry_nbr_offset, guerry_nbrs);
