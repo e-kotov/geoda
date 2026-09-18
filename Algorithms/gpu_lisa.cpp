@@ -34,20 +34,21 @@ using namespace std;
 // Number of neighbors to permute for each observation, self excluded, as in
 // CalcPseudoP_range(); -1 marks an observation that has only itself as neighbor: no
 // permutation test for it, but it is still drawn into permutations of other
-// observations (the Local Moran code tests w[newRandom].Size() > 0).
+// observations (Local Moran tests w[newRandom].Size() > 0, Local Join Count marks
+// isolates undefined).
 // Returns false if there are not enough observations to draw from, in which case the
 // permutation would never end.
-static bool prepare_num_nbrs(int rows, GalElement* w, bool skip_isolates, int* num_nbrs, int& max_n_nbrs)
+static bool prepare_num_nbrs(int rows, GalElement* w, int* num_nbrs, int& max_n_nbrs)
 {
     int candidates = 0;
     max_n_nbrs = 0;
     for (int i=0; i<rows; i++) {
         int nnbrs = (int)w[i].Size();
-        if (nnbrs > 0 || !skip_isolates) candidates++;
+        if (nnbrs > 0) candidates++; // isolates are never drawn
         if (w[i].Check(i)) {
             nnbrs -= 1; // exclude self from neighbors
         }
-        num_nbrs[i] = (skip_isolates && nnbrs == 0 && w[i].Size() > 0) ? -1 : nnbrs;
+        num_nbrs[i] = (nnbrs == 0 && w[i].Size() > 0) ? -1 : nnbrs;
         if (nnbrs > max_n_nbrs) max_n_nbrs = nnbrs;
     }
     return max_n_nbrs < candidates;
@@ -88,7 +89,7 @@ bool gpu_lisa(const char* cl_path, int rows, int permutations, unsigned long lon
     int max_n_nbrs = 0;
     int* num_nbrs = new int[rows];
     
-    if (!prepare_num_nbrs(rows, w, true, num_nbrs, max_n_nbrs)) {
+    if (!prepare_num_nbrs(rows, w, num_nbrs, max_n_nbrs)) {
         delete[] num_nbrs;
         return false;
     }
@@ -267,7 +268,7 @@ bool gpu_localjoincount(const char* cl_path, int rows, int permutations, unsigne
     int* num_nbrs = new int[rows];
     
     // any observation can be drawn into a permutation, isolates included
-    if (!prepare_num_nbrs(rows, w, false, num_nbrs, max_n_nbrs)) {
+    if (!prepare_num_nbrs(rows, w, num_nbrs, max_n_nbrs)) {
         delete[] num_nbrs;
         return false;
     }
