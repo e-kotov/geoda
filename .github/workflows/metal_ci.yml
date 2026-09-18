@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, macos-14]
+        os: [macos-15] # macos-14 runners expose no Metal device
 
     steps:
       - name: Checkout Code
