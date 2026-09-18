@@ -569,7 +569,7 @@ void LisaCoordinator::CalcPseudoP()
     } else {
         double* values = data1_vecs[0];
         double* local_moran = local_moran_vecs[0];
-        GalElement* w = weights->gal;
+        GalElement* w = Gal_vecs[0]->gal; // as the CPU: without links to isolates
         double* _sigLocal = sig_local_vecs[0];
         
         wxString exePath = GenUtils::GetExeDir();
