@@ -1231,3 +1231,19 @@ geoda repo root, except `bug-D-…`, `bug-GPU6-…` and `bug-GPU7-…`, whose ta
 modified on this development branch; those three were verified with `patch -p1 --dry-run` against
 a clean `git show master:` extraction, and `bug-P-…` against the libgeoda working tree.
 | `../opencl_bivariate/`, `../opencl_fix/` | GPU-1, GPU-2, GPU-3 (earlier work, re-read but not re-run) | `./build.sh` (needs PoCL) |
+
+
+## Addenda after the review of the Metal variants (2026-09-18)
+
+- **BUG B is not a defect at all**: the variants reviewer proved that computing `numNeighbors` as a true maximum
+  over periods is equivalent to the upstream loop for every input (mutant M10 of `private/variants_review/`
+  survives every test because it is an identity). Nothing to fix.
+- **OpenCL / Metal Join Count and isolates**: `JCCoordinator` marks isolates undefined (MLJCCoordinator.cpp:258-263),
+  its CPU draw rejects them (:649) and they get no p-value (:623). The first OpenCL fix on this branch (04529b11)
+  missed that; fixed in c0d260ac (OpenCL) and 16693d07 (Metal). Evidence: chicago carjackings with a distance band
+  (4 isolates): 124 of 5,272 all-samples checks failed for OpenCL before, 0 after.
+- **GPU-4 fixed** on this branch in 16693d07 (both coordinators draw `time(0)` when `reuse_last_seed` is false,
+  before the GPU call, per time period in `JCCoordinator`).
+- The new significance-category loop in `LisaCoordinator::CalcPseudoP()` also changes the OpenCL result for
+  self-only observations on Windows/Linux (second half of BUG C): intended.
+- Off macOS the OpenCL Join Count still has no undefined-values mask: the coordinator keeps such periods on the CPU.

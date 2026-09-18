@@ -76,11 +76,17 @@ regenerate with `Rscript Algorithms/make_test_data.R` (needs R package `sf`).
   as in the OpenCL kernels. With the same sequence the test requires **identical**
   p-values, not "close" ones.
 - Apple Silicon only (`MTLGPUFamilyApple7`, i.e. M1 and later); Intel Macs keep using OpenCL.
-- No fp64 on Apple GPUs: doubles are passed as (high, low) float pairs, sums use TwoSum,
-  kernels are compiled with fast math **off**. Permutations tied with the observed value
-  (difference below `tie_tol`) always count as larger, as the CPU's `>=` in
-  `LisaCoordinator::ComputeLarger()` intends (note: the OpenCL kernel uses `>`); the CPU
-  decides such ties by roundoff, which the test accounts for. Row-standardized weights are assumed.
+- No fp64 on Apple GPUs: the host converts each double to a 128 bit fixed point integer and the kernel
+  sums exactly (no floating point in the kernels). Float pairs (48 bits) were tried and are WRONG for real
+  data: they can neither recognize all exact ties with many neighbors nor resolve genuine differences of
+  ~1e-13 (values truncated to 10 decimals). Permutations whose exact difference from the observed value is
+  within the CPU's own double rounding band always count as `>=` (the CPU decides those by roundoff).
+  Decision 2026-09-18: no soft-float emulation of the CPU's rounding and no exact emulation of the CPU's
+  index rounding (both exist, verified, in the untracked `private/softfloat/`, `private/exact_round_final/`):
+  the differences are far below seed noise and not worth code or speed. Tests use a BOUNDS rule for tied
+  observations with an independently derived CPU error bound.
+- Local Join Count: `JCCoordinator` marks isolates undefined: they are never drawn and get no p-value.
+  Local Moran instead rejects candidates with `Size() == 0` and keeps self-only observations drawable.
 - Kernels return counts; p-values are computed on the host in double, otherwise
   `p <= 0.001` style significance categories break.
 - Scope: all OpenCL code that GeoDa actually calls is covered (`gpu_lisa`,
