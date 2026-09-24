@@ -24,10 +24,10 @@ inline void round_to_53_bits(thread ulong &hi, thread ulong &lo)
     uint drop = bits > 53 ? bits - 53 : 0;          // < 64
     ulong unit = 1UL << drop;                        // weight of the last kept bit
     ulong rest = lo & (unit - 1);                    // the dropped bits
-    ulong half = unit >> 1;                          // 0 if nothing is dropped
+    ulong tie = unit >> 1;                           // 0 if nothing is dropped
     ulong odd = (lo >> drop) & 1;
-    // up if rest > half, or rest == half and the kept part is odd
-    ulong up = (ulong)(drop != 0 && rest + odd > half);
+    // up if rest > tie, or rest == tie and the kept part is odd
+    ulong up = (ulong)(drop != 0 && rest + odd > tie);
     ulong kept = lo - rest;
     lo = kept + (up << drop);
     hi += (ulong)(lo < kept);
