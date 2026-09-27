@@ -6,6 +6,7 @@ on:
       - master
       - 'feature/**'
       - 'metal**'
+      - 'wip/**'
     paths:
       - 'Algorithms/**'
       - '.github/workflows/metal_ci.yml'
