@@ -15,12 +15,42 @@ inline ulong ThomasWangHash(ulong key)
     return key;
 }
 
-// Same draw as the CPU code: round(Gda::ThomasWangHashDouble(key) * max_rand),
-// i.e. round(hash * max_rand / 2^64), in integer arithmetic (no fp64 on Apple GPUs)
+// Rounds the unsigned integer hi * 2^64 + lo to 53 significant bits, ties to even, as
+// IEEE-754 binary64 round to nearest does. Requires fewer than 117 significant bits, so
+// that the bits it drops are all in lo.
+inline void round_to_53_bits(thread ulong &hi, thread ulong &lo)
+{
+    uint bits = hi != 0 ? 128 - (uint)clz(hi) : 64 - (uint)clz(lo);
+    uint drop = bits > 53 ? bits - 53 : 0;          // < 64
+    ulong unit = 1UL << drop;                        // weight of the last kept bit
+    ulong rest = lo & (unit - 1);                    // the dropped bits
+    ulong half = unit >> 1;                          // 0 if nothing is dropped
+    ulong odd = (lo >> drop) & 1;
+    // up if rest > half, or rest == half and the kept part is odd
+    ulong up = (ulong)(drop != 0 && rest + odd > half);
+    ulong kept = lo - rest;
+    lo = kept + (up << drop);
+    hi += (ulong)(lo < kept);
+}
+
+// The CPU draw, bit for bit: with h = ThomasWangHash(key), m = max_rand (1 <= m < 2^31),
+// Gda::ThomasWangHashDouble(key) * max_rand rounded as (int)floor(v + 0.5) is
+//   floor(fl(fl(fl(h) * 2^-64 * m) + 0.5))
+// where fl() rounds to binary64, ties to even: (a) h to double, (b) the product with m
+// (the factor 2^-64 is exact), (c) the addition of 0.5. There is no fp64 on Apple GPUs:
+// the values are integers in units of 2^-64 (below 2^96), so each fl() is exactly
+// round_to_53_bits() and floor() is the upper 64 bits.
 inline int ThomasWangHashIndex(ulong key, ulong max_rand)
 {
-    key = ThomasWangHash(key);
-    return (int)(mulhi(key, max_rand) + ((key * max_rand) >> 63));
+    ulong lo = ThomasWangHash(key), hi = 0;
+    round_to_53_bits(hi, lo);                        // (a) fl(h), at most 2^64
+    hi = hi * max_rand + mulhi(lo, max_rand);
+    lo = lo * max_rand;                              // exact fl(h) * m, below 2^95
+    round_to_53_bits(hi, lo);                        // (b)
+    lo += 1UL << 63;                                 // + 0.5, exact
+    hi += (ulong)(lo < (1UL << 63));
+    round_to_53_bits(hi, lo);                        // (c)
+    return (int)hi;
 }
 
 // Keys (GPU-7 in dev-notes/UPSTREAM_BUGS.md): permutation q of observation i draws from
