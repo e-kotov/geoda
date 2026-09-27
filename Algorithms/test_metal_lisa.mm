@@ -885,6 +885,337 @@ static void test_permutation_keys(const TestCase& tc)
     check(reference_diff == 0 && traced > 0, "the references draw from the keys TW(TW(seed + i) + q) + d");
 }
 
+// ---------------------------------------------------------------------------
+// The index of a draw.  The CPU computes
+//   (int)floor(Gda::ThomasWangHashDouble(key) * max_rand + 0.5), max_rand = n - 1,
+// i.e. with h the 64 bit hash of key, m = max_rand and fl() binary64 round to nearest even:
+//   floor(fl(fl(fl(h) * 2^-64 * m) + 0.5))
+// which is not the exact round(h * m / 2^64) next to half-integers.  ThomasWangHashIndex()
+// of each kernel source runs on the GPU for the vectors below, each h passed as the key
+// whose hash it is.
+// Test vectors (public domain, CC0), columns: kind, h, m, floor(h * m / 2^64), exact
+// round-half-up(h * m / 2^64), and the CPU's double arithmetic (the expected index).
+// "adversarial" rows are hashes next to a half-integer where the last two disagree.
+// ---------------------------------------------------------------------------
+static const struct {
+    const char* kind;
+    uint64_t h, m, ref_floor, round_exact, round_double;
+} kIndexVectors[] = {
+    { "edge", 0ULL, 1ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 1ULL, 1ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 18446744073709551615ULL, 1ULL, 0ULL, 1ULL, 1ULL },
+    { "edge", 18446744073709551614ULL, 1ULL, 0ULL, 1ULL, 1ULL },
+    { "edge", 9223372036854775808ULL, 1ULL, 0ULL, 1ULL, 1ULL },
+    { "edge", 9223372036854775807ULL, 1ULL, 0ULL, 0ULL, 1ULL },
+    { "random", 8748534153485358512ULL, 1ULL, 0ULL, 0ULL, 0ULL },
+    { "random", 3040900993826735515ULL, 1ULL, 0ULL, 0ULL, 0ULL },
+    { "random", 3453997556048239312ULL, 1ULL, 0ULL, 0ULL, 0ULL },
+    { "random", 16431732851926010853ULL, 1ULL, 0ULL, 1ULL, 1ULL },
+    { "random", 8204724074003728306ULL, 1ULL, 0ULL, 0ULL, 0ULL },
+    { "random", 17801246309558322749ULL, 1ULL, 0ULL, 1ULL, 1ULL },
+    { "adversarial", 9223372036854774273ULL, 1ULL, 0ULL, 0ULL, 1ULL },
+    { "edge", 0ULL, 2ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 1ULL, 2ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 18446744073709551615ULL, 2ULL, 1ULL, 2ULL, 2ULL },
+    { "edge", 18446744073709551614ULL, 2ULL, 1ULL, 2ULL, 2ULL },
+    { "edge", 9223372036854775808ULL, 2ULL, 1ULL, 1ULL, 1ULL },
+    { "edge", 9223372036854775807ULL, 2ULL, 0ULL, 1ULL, 1ULL },
+    { "random", 5436414676741331430ULL, 2ULL, 0ULL, 1ULL, 1ULL },
+    { "random", 17695236977110443605ULL, 2ULL, 1ULL, 2ULL, 2ULL },
+    { "random", 6608202593579392985ULL, 2ULL, 0ULL, 1ULL, 1ULL },
+    { "random", 8830117261193360166ULL, 2ULL, 0ULL, 1ULL, 1ULL },
+    { "random", 18428911871858657728ULL, 2ULL, 1ULL, 2ULL, 2ULL },
+    { "random", 4963870673656021843ULL, 2ULL, 0ULL, 1ULL, 1ULL },
+    { "adversarial", 13835058055282162688ULL, 2ULL, 1ULL, 1ULL, 2ULL },
+    { "adversarial", 4611686018427387137ULL, 2ULL, 0ULL, 0ULL, 1ULL },
+    { "edge", 0ULL, 63ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 1ULL, 63ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 18446744073709551615ULL, 63ULL, 62ULL, 63ULL, 63ULL },
+    { "edge", 18446744073709551614ULL, 63ULL, 62ULL, 63ULL, 63ULL },
+    { "edge", 9223372036854775808ULL, 63ULL, 31ULL, 32ULL, 32ULL },
+    { "edge", 9223372036854775807ULL, 63ULL, 31ULL, 31ULL, 32ULL },
+    { "random", 5662138723243855355ULL, 63ULL, 19ULL, 19ULL, 19ULL },
+    { "random", 15609101158995774752ULL, 63ULL, 53ULL, 53ULL, 53ULL },
+    { "random", 2986862389575396538ULL, 63ULL, 10ULL, 10ULL, 10ULL },
+    { "random", 10189681537531836771ULL, 63ULL, 34ULL, 35ULL, 35ULL },
+    { "random", 7858604351462645841ULL, 63ULL, 26ULL, 27ULL, 27ULL },
+    { "random", 15126019358282456657ULL, 63ULL, 51ULL, 52ULL, 52ULL },
+    { "adversarial", 4245679191568070913ULL, 63ULL, 14ULL, 14ULL, 15ULL },
+    { "adversarial", 13029843036191667201ULL, 63ULL, 44ULL, 44ULL, 45ULL },
+    { "adversarial", 17129119497016011776ULL, 63ULL, 58ULL, 58ULL, 59ULL },
+    { "adversarial", 11858621190241854465ULL, 63ULL, 40ULL, 40ULL, 41ULL },
+    { "adversarial", 3952873730080617729ULL, 63ULL, 13ULL, 13ULL, 14ULL },
+    { "adversarial", 3367262807105711361ULL, 63ULL, 11ULL, 11ULL, 12ULL },
+    { "edge", 0ULL, 64ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 1ULL, 64ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 18446744073709551615ULL, 64ULL, 63ULL, 64ULL, 64ULL },
+    { "edge", 18446744073709551614ULL, 64ULL, 63ULL, 64ULL, 64ULL },
+    { "edge", 9223372036854775808ULL, 64ULL, 32ULL, 32ULL, 32ULL },
+    { "edge", 9223372036854775807ULL, 64ULL, 31ULL, 32ULL, 32ULL },
+    { "random", 4715759604831619476ULL, 64ULL, 16ULL, 16ULL, 16ULL },
+    { "random", 18117819460305202311ULL, 64ULL, 62ULL, 63ULL, 63ULL },
+    { "random", 13167058813397311518ULL, 64ULL, 45ULL, 46ULL, 46ULL },
+    { "random", 3420277740200564190ULL, 64ULL, 11ULL, 12ULL, 12ULL },
+    { "random", 4627608410304777077ULL, 64ULL, 16ULL, 16ULL, 16ULL },
+    { "random", 1725165506092486947ULL, 64ULL, 5ULL, 6ULL, 6ULL },
+    { "adversarial", 432345564227567584ULL, 64ULL, 1ULL, 1ULL, 2ULL },
+    { "adversarial", 12538021362599459840ULL, 64ULL, 43ULL, 43ULL, 44ULL },
+    { "adversarial", 17149707381026847744ULL, 64ULL, 59ULL, 59ULL, 60ULL },
+    { "adversarial", 16285016252571712512ULL, 64ULL, 56ULL, 56ULL, 57ULL },
+    { "adversarial", 16861477004875136000ULL, 64ULL, 58ULL, 58ULL, 59ULL },
+    { "adversarial", 1008806316530991040ULL, 64ULL, 3ULL, 3ULL, 4ULL },
+    { "edge", 0ULL, 65ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 1ULL, 65ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 18446744073709551615ULL, 65ULL, 64ULL, 65ULL, 65ULL },
+    { "edge", 18446744073709551614ULL, 65ULL, 64ULL, 65ULL, 65ULL },
+    { "edge", 9223372036854775808ULL, 65ULL, 32ULL, 33ULL, 33ULL },
+    { "edge", 9223372036854775807ULL, 65ULL, 32ULL, 32ULL, 33ULL },
+    { "random", 17443301496972819357ULL, 65ULL, 61ULL, 61ULL, 61ULL },
+    { "random", 6370648651045915050ULL, 65ULL, 22ULL, 22ULL, 22ULL },
+    { "random", 1308966240492466361ULL, 65ULL, 4ULL, 5ULL, 5ULL },
+    { "random", 14435696468229893784ULL, 65ULL, 50ULL, 51ULL, 51ULL },
+    { "random", 4739983750001254597ULL, 65ULL, 16ULL, 17ULL, 17ULL },
+    { "random", 17092094246616142916ULL, 65ULL, 60ULL, 60ULL, 60ULL },
+    { "adversarial", 4115042908750592257ULL, 65ULL, 14ULL, 14ULL, 15ULL },
+    { "adversarial", 17737253917028414465ULL, 65ULL, 62ULL, 62ULL, 63ULL },
+    { "adversarial", 5534023222112864769ULL, 65ULL, 19ULL, 19ULL, 20ULL },
+    { "adversarial", 17169661791683505152ULL, 65ULL, 60ULL, 60ULL, 61ULL },
+    { "adversarial", 6385411410130228736ULL, 65ULL, 22ULL, 22ULL, 23ULL },
+    { "adversarial", 2979858658060773633ULL, 65ULL, 10ULL, 10ULL, 11ULL },
+    { "edge", 0ULL, 99ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 1ULL, 99ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 18446744073709551615ULL, 99ULL, 98ULL, 99ULL, 99ULL },
+    { "edge", 18446744073709551614ULL, 99ULL, 98ULL, 99ULL, 99ULL },
+    { "edge", 9223372036854775808ULL, 99ULL, 49ULL, 50ULL, 50ULL },
+    { "edge", 9223372036854775807ULL, 99ULL, 49ULL, 49ULL, 50ULL },
+    { "random", 16152619264937409460ULL, 99ULL, 86ULL, 87ULL, 87ULL },
+    { "random", 16989531492326221251ULL, 99ULL, 91ULL, 91ULL, 91ULL },
+    { "random", 10445875748069924936ULL, 99ULL, 56ULL, 56ULL, 56ULL },
+    { "random", 17080794976938710152ULL, 99ULL, 91ULL, 92ULL, 92ULL },
+    { "random", 11387797258364787745ULL, 99ULL, 61ULL, 61ULL, 61ULL },
+    { "random", 6799315070797952089ULL, 99ULL, 36ULL, 36ULL, 36ULL },
+    { "adversarial", 11273010267266948096ULL, 99ULL, 60ULL, 60ULL, 61ULL },
+    { "adversarial", 3633449590276123392ULL, 99ULL, 19ULL, 19ULL, 20ULL },
+    { "adversarial", 1211149863425374592ULL, 99ULL, 6ULL, 6ULL, 7ULL },
+    { "adversarial", 15744948224529867777ULL, 99ULL, 84ULL, 84ULL, 85ULL },
+    { "adversarial", 6242080065346161153ULL, 99ULL, 33ULL, 33ULL, 34ULL },
+    { "adversarial", 17980917203161328640ULL, 99ULL, 96ULL, 96ULL, 97ULL },
+    { "edge", 0ULL, 3084ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 1ULL, 3084ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 18446744073709551615ULL, 3084ULL, 3083ULL, 3084ULL, 3084ULL },
+    { "edge", 18446744073709551614ULL, 3084ULL, 3083ULL, 3084ULL, 3084ULL },
+    { "edge", 9223372036854775808ULL, 3084ULL, 1542ULL, 1542ULL, 1542ULL },
+    { "edge", 9223372036854775807ULL, 3084ULL, 1541ULL, 1542ULL, 1542ULL },
+    { "random", 10160100024651089587ULL, 3084ULL, 1698ULL, 1699ULL, 1699ULL },
+    { "random", 15176291795094487678ULL, 3084ULL, 2537ULL, 2537ULL, 2537ULL },
+    { "random", 14548137622477180282ULL, 3084ULL, 2432ULL, 2432ULL, 2432ULL },
+    { "random", 16588115188394618080ULL, 3084ULL, 2773ULL, 2773ULL, 2773ULL },
+    { "random", 7949577795711262521ULL, 3084ULL, 1329ULL, 1329ULL, 1329ULL },
+    { "random", 11415942830108595911ULL, 3084ULL, 1908ULL, 1909ULL, 1909ULL },
+    { "adversarial", 2024715586559884160ULL, 3084ULL, 338ULL, 338ULL, 339ULL },
+    { "adversarial", 7330248009834971649ULL, 3084ULL, 1225ULL, 1225ULL, 1226ULL },
+    { "adversarial", 17570463915863100416ULL, 3084ULL, 2937ULL, 2937ULL, 2938ULL },
+    { "adversarial", 2353694485410086656ULL, 3084ULL, 393ULL, 393ULL, 394ULL },
+    { "adversarial", 3460259872451677952ULL, 3084ULL, 578ULL, 578ULL, 579ULL },
+    { "adversarial", 4734305426180645300ULL, 3084ULL, 791ULL, 792ULL, 791ULL },
+    { "edge", 0ULL, 50175ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 1ULL, 50175ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 18446744073709551615ULL, 50175ULL, 50174ULL, 50175ULL, 50175ULL },
+    { "edge", 18446744073709551614ULL, 50175ULL, 50174ULL, 50175ULL, 50175ULL },
+    { "edge", 9223372036854775808ULL, 50175ULL, 25087ULL, 25088ULL, 25088ULL },
+    { "edge", 9223372036854775807ULL, 50175ULL, 25087ULL, 25087ULL, 25088ULL },
+    { "random", 5212254611448065585ULL, 50175ULL, 14177ULL, 14177ULL, 14177ULL },
+    { "random", 2230441529477153709ULL, 50175ULL, 6066ULL, 6067ULL, 6067ULL },
+    { "random", 3288801556089212778ULL, 50175ULL, 8945ULL, 8946ULL, 8946ULL },
+    { "random", 7802498179873338356ULL, 50175ULL, 21222ULL, 21223ULL, 21223ULL },
+    { "random", 7797000902482130963ULL, 50175ULL, 21207ULL, 21208ULL, 21208ULL },
+    { "random", 327574877315869987ULL, 50175ULL, 891ULL, 891ULL, 891ULL },
+    { "adversarial", 9536975877310663680ULL, 50175ULL, 25940ULL, 25940ULL, 25941ULL },
+    { "adversarial", 16804643776644803584ULL, 50175ULL, 45708ULL, 45708ULL, 45709ULL },
+    { "adversarial", 12025218306625387520ULL, 50175ULL, 32708ULL, 32708ULL, 32709ULL },
+    { "adversarial", 17568248907508673536ULL, 50175ULL, 47785ULL, 47785ULL, 47786ULL },
+    { "adversarial", 2592103021259375873ULL, 50175ULL, 7050ULL, 7050ULL, 7051ULL },
+    { "adversarial", 3742841615194819841ULL, 50175ULL, 10180ULL, 10180ULL, 10181ULL },
+    { "edge", 0ULL, 179673ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 1ULL, 179673ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 18446744073709551615ULL, 179673ULL, 179672ULL, 179673ULL, 179673ULL },
+    { "edge", 18446744073709551614ULL, 179673ULL, 179672ULL, 179673ULL, 179673ULL },
+    { "edge", 9223372036854775808ULL, 179673ULL, 89836ULL, 89837ULL, 89837ULL },
+    { "edge", 9223372036854775807ULL, 179673ULL, 89836ULL, 89836ULL, 89837ULL },
+    { "random", 5373418113881674731ULL, 179673ULL, 52337ULL, 52338ULL, 52338ULL },
+    { "random", 706943959524944652ULL, 179673ULL, 6885ULL, 6886ULL, 6886ULL },
+    { "random", 4953507794236458842ULL, 179673ULL, 48247ULL, 48248ULL, 48248ULL },
+    { "random", 3622337693708615252ULL, 179673ULL, 35281ULL, 35282ULL, 35282ULL },
+    { "random", 10012723972308955048ULL, 179673ULL, 97524ULL, 97525ULL, 97525ULL },
+    { "random", 68224561046651767ULL, 179673ULL, 664ULL, 665ULL, 665ULL },
+    { "adversarial", 7586015981757348353ULL, 179673ULL, 73888ULL, 73888ULL, 73889ULL },
+    { "adversarial", 13607211151264418816ULL, 179673ULL, 132535ULL, 132535ULL, 132536ULL },
+    { "adversarial", 12724981368128465920ULL, 179673ULL, 123942ULL, 123942ULL, 123943ULL },
+    { "adversarial", 2692325464688196865ULL, 179673ULL, 26223ULL, 26223ULL, 26224ULL },
+    { "adversarial", 14016960838742086657ULL, 179673ULL, 136526ULL, 136526ULL, 136527ULL },
+    { "adversarial", 9953755218191813632ULL, 179673ULL, 96950ULL, 96950ULL, 96951ULL },
+    { "edge", 0ULL, 9999999ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 1ULL, 9999999ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 18446744073709551615ULL, 9999999ULL, 9999998ULL, 9999999ULL, 9999999ULL },
+    { "edge", 18446744073709551614ULL, 9999999ULL, 9999998ULL, 9999999ULL, 9999999ULL },
+    { "edge", 9223372036854775808ULL, 9999999ULL, 4999999ULL, 5000000ULL, 5000000ULL },
+    { "edge", 9223372036854775807ULL, 9999999ULL, 4999999ULL, 4999999ULL, 5000000ULL },
+    { "random", 12083328094203645410ULL, 9999999ULL, 6550384ULL, 6550385ULL, 6550385ULL },
+    { "random", 6565717668691949177ULL, 9999999ULL, 3559282ULL, 3559282ULL, 3559282ULL },
+    { "random", 15726206216329285461ULL, 9999999ULL, 8525192ULL, 8525193ULL, 8525193ULL },
+    { "random", 16492019656848968587ULL, 9999999ULL, 8940340ULL, 8940341ULL, 8940341ULL },
+    { "random", 7290873431061689692ULL, 9999999ULL, 3952390ULL, 3952390ULL, 3952390ULL },
+    { "random", 14194409539099993526ULL, 9999999ULL, 7694804ULL, 7694804ULL, 7694804ULL },
+    { "adversarial", 10421086045192803329ULL, 9999999ULL, 5649281ULL, 5649281ULL, 5649282ULL },
+    { "adversarial", 17148867002046582083ULL, 9999999ULL, 9296418ULL, 9296418ULL, 9296419ULL },
+    { "adversarial", 2004981425555651968ULL, 9999999ULL, 1086902ULL, 1086902ULL, 1086903ULL },
+    { "adversarial", 16390364480001504257ULL, 9999999ULL, 8885233ULL, 8885233ULL, 8885234ULL },
+    { "adversarial", 7720268460488712705ULL, 9999999ULL, 4185165ULL, 4185165ULL, 4185166ULL },
+    { "adversarial", 7946425565448102401ULL, 9999999ULL, 4307765ULL, 4307765ULL, 4307766ULL },
+    { "edge", 0ULL, 2147483646ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 1ULL, 2147483646ULL, 0ULL, 0ULL, 0ULL },
+    { "edge", 18446744073709551615ULL, 2147483646ULL, 2147483645ULL, 2147483646ULL, 2147483646ULL },
+    { "edge", 18446744073709551614ULL, 2147483646ULL, 2147483645ULL, 2147483646ULL, 2147483646ULL },
+    { "edge", 9223372036854775808ULL, 2147483646ULL, 1073741823ULL, 1073741823ULL, 1073741823ULL },
+    { "edge", 9223372036854775807ULL, 2147483646ULL, 1073741822ULL, 1073741823ULL, 1073741823ULL },
+    { "random", 54770516282629522ULL, 2147483646ULL, 6376127ULL, 6376127ULL, 6376127ULL },
+    { "random", 7992434987846178985ULL, 2147483646ULL, 930441890ULL, 930441890ULL, 930441890ULL },
+    { "random", 3712842481873936856ULL, 2147483646ULL, 432231752ULL, 432231752ULL, 432231752ULL },
+    { "random", 15365619671414354203ULL, 2147483646ULL, 1788793557ULL, 1788793557ULL, 1788793557ULL },
+    { "random", 9549190974430627769ULL, 2147483646ULL, 1111672139ULL, 1111672139ULL, 1111672139ULL },
+    { "random", 5047527495138644598ULL, 2147483646ULL, 587609537ULL, 587609537ULL, 587609537ULL },
+    { "adversarial", 1897204158693434497ULL, 2147483646ULL, 220863632ULL, 220863632ULL, 220863633ULL },
+    { "adversarial", 7420966782953997824ULL, 2147483646ULL, 863914235ULL, 863914235ULL, 863914236ULL },
+    { "adversarial", 13797595615324773376ULL, 2147483646ULL, 1606251532ULL, 1606251532ULL, 1606251533ULL },
+    { "adversarial", 10410758400260031489ULL, 2147483646ULL, 1211971788ULL, 1211971788ULL, 1211971789ULL },
+    { "adversarial", 9945972732864545793ULL, 2147483646ULL, 1157863615ULL, 1157863615ULL, 1157863616ULL },
+    { "adversarial", 12483276909321782273ULL, 2147483646ULL, 1453244697ULL, 1453244697ULL, 1453244698ULL },
+};
+
+// The inverse of the 64 bit Thomas Wang hash: the key whose hash is h
+static uint64_t ThomasWangHashInverse(uint64_t h)
+{
+    uint64_t t;
+    t = h - (h << 31);                        // h = k + (k << 31)
+    h = h - (t << 31);
+    t = h ^ (h >> 28);                        // h = k ^ (k >> 28)
+    h = h ^ (t >> 28);
+    h *= 14933078535860113213ULL;             // h = k * 21
+    t = h ^ (h >> 14);                        // h = k ^ (k >> 14)
+    t = h ^ (t >> 14);
+    t = h ^ (t >> 14);
+    h = h ^ (t >> 14);
+    h *= 15244667743933553977ULL;             // h = k * 265
+    t = h ^ (h >> 24);                        // h = k ^ (k >> 24)
+    h = h ^ (t >> 24);
+    t = ~h;                                   // h = ~k + (k << 21)
+    t = ~(h - (t << 21));
+    t = ~(h - (t << 21));
+    h = ~(h - (t << 21));
+    return h;
+}
+
+// ThomasWangHashIndex(keys[t], m[t]) of the kernel source at metal_path, on the GPU
+static bool gpu_hash_index(const char* metal_path, const std::vector<uint64_t>& keys,
+                           const std::vector<uint64_t>& m, std::vector<int>& index)
+{
+    @autoreleasepool {
+        id<MTLDevice> device = metal_device();
+        NSError* error = nil;
+        NSString* src = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:metal_path]
+                                                  encoding:NSUTF8StringEncoding error:&error];
+        if (!device || !src) return false;
+        src = [src stringByAppendingString:
+            @"\nkernel void hash_index_test(device const ulong* keys [[buffer(0)]],\n"
+             "                            device const ulong* m [[buffer(1)]],\n"
+             "                            device int* index [[buffer(2)]],\n"
+             "                            uint t [[thread_position_in_grid]])\n"
+             "{\n"
+             "    index[t] = ThomasWangHashIndex(keys[t], m[t]);\n"
+             "}\n"];
+        MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+        options.preprocessorMacros = @{ @"MAX_NBRS" : @64, @"N_PERIODS" : @1, @"HAS_UNDEF" : @0 };
+        id<MTLLibrary> library = [device newLibraryWithSource:src options:options error:&error];
+        id<MTLFunction> func = library ? [library newFunctionWithName:@"hash_index_test"] : nil;
+        id<MTLComputePipelineState> pipeline = func ? [device newComputePipelineStateWithFunction:func error:&error] : nil;
+        if (!pipeline) {
+            if (error) printf("  %s\n", [[error localizedDescription] UTF8String]);
+            return false;
+        }
+        const NSUInteger count = keys.size();
+        id<MTLBuffer> bufKeys = [device newBufferWithBytes:keys.data() length:count * sizeof(uint64_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bufM = [device newBufferWithBytes:m.data() length:count * sizeof(uint64_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bufIndex = [device newBufferWithLength:count * sizeof(int) options:MTLResourceStorageModeShared];
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+        if (!bufKeys || !bufM || !bufIndex || !queue) return false;
+
+        id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:bufKeys offset:0 atIndex:0];
+        [encoder setBuffer:bufM offset:0 atIndex:1];
+        [encoder setBuffer:bufIndex offset:0 atIndex:2];
+        NSUInteger group_size = pipeline.maxTotalThreadsPerThreadgroup;
+        if (group_size > count) group_size = count;
+        [encoder dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(group_size, 1, 1)];
+        [encoder endEncoding];
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+        if (cmdBuf.status != MTLCommandBufferStatusCompleted) return false;
+        const int* result = (const int*)[bufIndex contents];
+        index.assign(result, result + count);
+        return true;
+    }
+}
+
+static void test_hash_index(const char* lisa_path, const char* jc_path)
+{
+    const size_t count = sizeof(kIndexVectors) / sizeof(*kIndexVectors);
+    printf("index of a draw, as the CPU's double arithmetic (%d vectors)\n", (int)count);
+    std::vector<uint64_t> keys(count), m(count);
+    int inverse_diff = 0;
+    for (size_t r = 0; r < count; r++) {
+        keys[r] = ThomasWangHashInverse(kIndexVectors[r].h);
+        m[r] = kIndexVectors[r].m;
+        inverse_diff += ThomasWangHash(keys[r]) != kIndexVectors[r].h;
+    }
+    check(inverse_diff == 0, "the keys hash to the h of the vectors");
+
+    const char* kinds[] = { "edge", "random", "adversarial" };
+    const char* paths[] = { lisa_path, jc_path };
+    const char* path_names[] = { "lisa_kernel.metal", "localjc_kernel.metal" };
+    std::vector<int> gpu[2];
+    bool gpu_ok[2];
+    for (int k = 0; k < 2; k++) {
+        gpu_ok[k] = gpu_hash_index(paths[k], keys, m, gpu[k]);
+        check(gpu_ok[k], std::string("ThomasWangHashIndex() of ") + path_names[k] + " runs");
+    }
+    for (size_t g = 0; g < sizeof(kinds) / sizeof(*kinds); g++) {
+        int rows = 0, host_diff = 0, gpu_diff[2] = { 0, 0 };
+        for (size_t r = 0; r < count; r++) {
+            if (std::string(kIndexVectors[r].kind) != kinds[g]) continue;
+            rows++;
+            // the CPU's arithmetic, one rounding per statement
+            double v = 5.42101086242752217E-20 * (double)kIndexVectors[r].h;
+            v = v * (double)kIndexVectors[r].m;
+            v = v + 0.5;
+            host_diff += (uint64_t)floor(v) != kIndexVectors[r].round_double;
+            for (int k = 0; k < 2; k++)
+                gpu_diff[k] += gpu_ok[k] && (uint64_t)gpu[k][r] != kIndexVectors[r].round_double;
+        }
+        char what[160];
+        snprintf(what, sizeof(what), "%s (%d rows): double arithmetic on the host gives the expected index (%d differ)",
+                 kinds[g], rows, host_diff);
+        check(rows > 0 && host_diff == 0, what);
+        for (int k = 0; k < 2; k++) {
+            if (!gpu_ok[k]) continue;
+            snprintf(what, sizeof(what), "%s (%d rows): ThomasWangHashIndex() of %s on the GPU gives the expected index (%d differ)",
+                     kinds[g], rows, path_names[k], gpu_diff[k]);
+            check(gpu_diff[k] == 0, what);
+        }
+    }
+}
+
 int main(int argc, char* argv[])
 {
     const char* lisa_path = (argc > 1) ? argv[1] : "Algorithms/lisa_kernel.metal";
@@ -899,6 +1230,7 @@ int main(int argc, char* argv[])
     TestCase g = sample_data("Guerry donatns, queen", guerry_n, guerry_x, guerry_nbr_offset, guerry_nbrs);
     TestCase u = sample_data("US Homicides hr90, queen", natregimes_n, natregimes_x, natregimes_nbr_offset, natregimes_nbrs);
     TestCase l = lattice(50);
+    test_hash_index(lisa_path, jc_path);
     test_permutation_keys(g);
     run(g, lisa_path, jc_path, 999);
     run(g, lisa_path, jc_path, 99999);
